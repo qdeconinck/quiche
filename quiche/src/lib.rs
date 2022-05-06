@@ -9216,7 +9216,8 @@ mod tests {
         assert!(pipe.server.stream_finished(4));
 
         // Sending RESET_STREAM again shouldn't make stream readable again.
-        assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(39));
+        pipe.send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
