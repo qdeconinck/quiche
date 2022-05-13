@@ -229,7 +229,6 @@ pub fn connect(
     let mut pkt_count = 0;
 
     let mut scid_sent = false;
-    let mut dcid_recv = false;
     let mut new_path_probed = false;
     let mut migrated = false;
 
@@ -411,21 +410,13 @@ pub fn connect(
             si_conn.handle_quack_acks(&mut conn, &mut buf, &app_data_start);
         }
 
-        // Handle QUIC events.
-        while let Ok(qe) = conn.poll() {
+        // Handle path events.
+        while let Ok(qe) = conn.poll_path() {
             match qe {
-                quiche::QuicEvent::ConnectionId(
-                    quiche::ConnectionIdEvent::RetiredSource(cid),
-                ) => {
-                    info!("Retiring source CID {:?}", cid);
-                },
-                quiche::QuicEvent::Path(quiche::PathEvent::New(..)) => {
+                quiche::PathEvent::New(..) => {
                     panic!("Should not see new path");
                 },
-                quiche::QuicEvent::Path(quiche::PathEvent::Validated(
-                    local_addr,
-                    peer_addr,
-                )) => {
+                quiche::PathEvent::Validated(local_addr, peer_addr) => {
                     info!(
                         "Path ({}, {}) is now validated",
                         local_addr, peer_addr
@@ -433,51 +424,37 @@ pub fn connect(
                     conn.migrate(local_addr, peer_addr).unwrap();
                     migrated = true;
                 },
-                quiche::QuicEvent::Path(quiche::PathEvent::FailedValidation(
-                    local_addr,
-                    peer_addr,
-                )) => {
+                quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
                     info!(
                         "Path ({}, {}) failed validation",
                         local_addr, peer_addr
                     );
                 },
-                quiche::QuicEvent::Path(quiche::PathEvent::Closed(
-                    local_addr,
-                    peer_addr,
-                )) => {
+                quiche::PathEvent::Closed(local_addr, peer_addr) => {
                     info!(
                         "Path ({}, {}) is now closed and unusable",
                         local_addr, peer_addr
                     );
                 },
-                quiche::QuicEvent::Path(
-                    quiche::PathEvent::ReusedSourceConnectionId(
-                        cid_seq,
-                        old,
-                        new,
-                    ),
+                quiche::PathEvent::ReusedSourceConnectionId(
+                    cid_seq,
+                    old,
+                    new,
                 ) => {
                     info!(
                         "Peer reused cid seq {} (intially {:?}) on {:?}",
                         cid_seq, old, new
                     );
                 },
-                quiche::QuicEvent::Path(quiche::PathEvent::PeerMigrated(..)) => {
+                quiche::PathEvent::PeerMigrated(..) => {
                     panic!("Server-side event only");
                 },
-                quiche::QuicEvent::ConnectionId(
-                    quiche::ConnectionIdEvent::NewDestination(seq, ..),
-                ) => {
-                    info!("Received new destination CID with seq {}", seq);
-                    dcid_recv = true;
-                },
-                quiche::QuicEvent::ConnectionId(
-                    quiche::ConnectionIdEvent::RetiredDestination(seq),
-                ) => {
-                    info!("Retired destination CID with seq {}", seq);
-                },
             }
+        }
+
+        // See whether source Connection IDs have been retired.
+        for retired_scid in conn.retired_scids() {
+            info!("Retiring source CID {:?}", retired_scid);
         }
 
         // Provides as many CIDs as possible.
@@ -489,7 +466,11 @@ pub fn connect(
             scid_sent = true;
         }
 
-        if args.perform_migration && !new_path_probed && scid_sent && dcid_recv {
+        if args.perform_migration &&
+            !new_path_probed &&
+            scid_sent &&
+            conn.available_dcids() > 0
+        {
             let additional_local_addr = sockets[1].local_addr().unwrap();
             conn.probe_path(additional_local_addr, peer_addr).unwrap();
             new_path_probed = true;

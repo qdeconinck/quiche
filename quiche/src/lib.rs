@@ -582,15 +582,6 @@ impl std::convert::From<octets::BufferTooShortError> for Error {
     }
 }
 
-/// A QUIC connection event.
-#[derive(Clone, Debug, PartialEq)]
-pub enum QuicEvent {
-    /// A path-specific event.
-    Path(PathEvent),
-    /// A connection ID-specific event.
-    ConnectionId(ConnectionIdEvent),
-}
-
 /// Ancillary information about incoming packets.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecvInfo {
@@ -2483,6 +2474,8 @@ impl Connection {
 
                 path.max_send_bytes = buf_size * MAX_AMPLIFICATION_FACTOR;
                 path.active_scid_seq = Some(in_scid_seq);
+                // Automatically probes the new path.
+                path.request_validation();
                 let pid = path_mgr.insert_path(path, self.is_server)?;
 
                 // Do not record path reuse.
@@ -5230,6 +5223,10 @@ impl Connection {
     /// The caller might also want to probe an existing path. In such case, it
     /// triggers a PATH_CHALLENGE frame, but it does not require spare CIDs.
     ///
+    /// A server always probes a new path it observes. Calling this method is
+    /// hence not required to validate a new path. However, a server can still
+    /// request an additional path validation of the proposed 4-tuple.
+    ///
     /// Calling this method several times before calling [`send()`] or
     /// [`path_send()`] results in a single probe being generated. An
     /// application wanting to send multiple in-flight probes must call this
@@ -5455,28 +5452,41 @@ impl Connection {
         Ok(())
     }
 
-    /// Processes QUIC-specific events.
+    /// Processes path-specific events.
     ///
-    /// On success it returns a [`QuicEvent`], or [`Done`] when there are no
-    /// events to report. Please refer to [`QuicEvent`] for the exhaustive event
+    /// On success it returns a [`PathEvent`], or [`Done`] when there are no
+    /// events to report. Please refer to [`PathEvent`] for the exhaustive event
     /// list.
     ///
     /// Note that all events are edge-triggered, meaning that once reported they
     /// will not be reported again by calling this method again, until the event
     /// is re-armed.
     ///
-    /// [`QuicEvent`]: enum.QuicEvent.html
+    /// [`PathEvent`]: enum.PathEvent.html
     /// [`Done`]: enum.Error.html#variant.Done
-    pub fn poll(&mut self) -> Result<QuicEvent> {
-        if let Some(ce) = self.ids.pop_event() {
-            return Ok(QuicEvent::ConnectionId(ce));
-        }
-
+    pub fn poll_path(&mut self) -> Result<PathEvent> {
         if let Some(pe) = self.path_mgr.pop_event() {
-            return Ok(QuicEvent::Path(pe));
+            return Ok(pe);
         }
 
         Err(Error::Done)
+    }
+
+    /// Returns an iterator over source `ConnectionId` that have been retired.
+    ///
+    /// Note that the iterator will only report a given `ConnectionId` once,
+    /// i.e., calling twice this method can return different results.
+    pub fn retired_scids(&mut self) -> ConnectionIdIter {
+        self.ids.retired_scids()
+    }
+
+    /// Returns the number of spare Destination Connection IDs, i.e.,
+    /// Destination Connection IDs that are still unused.
+    ///
+    /// Note that this function returns 0 if the host uses zero length
+    /// Destination Connection IDs.
+    pub fn available_dcids(&self) -> usize {
+        self.ids.available_dcids()
     }
 
     /// Returns an iterator over destination `SockAddr`s whose their association
@@ -12968,8 +12978,8 @@ mod tests {
         assert_eq!(pipe.handshake(), Ok(()));
 
         // So far, there should not have any QUIC event.
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
         assert_eq!(pipe.client.spare_scid_spots(), 2);
 
         let (scid, reset_token) = testing::create_cid_and_reset_token(16);
@@ -12979,16 +12989,9 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // At this point, the server should be notified that it has a new CID.
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::NewDestination(
-                1,
-                scid,
-                reset_token
-            )))
-        );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.available_dcids(), 1);
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         assert_eq!(pipe.client.spare_scid_spots(), 1);
 
         // Now, a second CID can be provided.
@@ -12999,16 +13002,9 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // At this point, the server should be notified that it has a new CID.
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::NewDestination(
-                2,
-                scid,
-                reset_token
-            )))
-        );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.available_dcids(), 2);
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         assert_eq!(pipe.client.spare_scid_spots(), 0);
 
         // If now the client tries to send another CID, it reports an error
@@ -13042,8 +13038,8 @@ mod tests {
         assert_eq!(pipe.handshake(), Ok(()));
 
         // So far, there should not have any QUIC event.
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
         assert_eq!(pipe.client.spare_scid_spots(), 1);
 
         let scid = pipe.client.source_id().into_owned();
@@ -13058,16 +13054,9 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // At this point, the server should be notified that it has a new CID.
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::NewDestination(
-                1,
-                scid_1.clone(),
-                reset_token_1
-            )))
-        );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.available_dcids(), 1);
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         assert_eq!(pipe.client.spare_scid_spots(), 0);
 
         // Now we assume that the client wants to advertise more source
@@ -13084,33 +13073,15 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
-        // At this point, the server is first notified that it cannot use ID 0
-        // anymore.
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::ConnectionId(
-                ConnectionIdEvent::RetiredDestination(0)
-            ))
-        );
-        // It also receives the new CID.
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::NewDestination(
-                2,
-                scid_2.clone(),
-                reset_token_2
-            )))
-        );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        // At this point, the server still have a spare DCID.
+        assert_eq!(pipe.server.available_dcids(), 1);
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
 
         // Client should have received a retired notification.
-        assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::RetiredSource(
-                scid
-            )))
-        );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        let mut r = pipe.client.retired_scids();
+        assert_eq!(r.next(), Some(scid));
+        assert_eq!(r.next(), None);
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         assert_eq!(pipe.client.spare_scid_spots(), 0);
 
         // The active Destination Connection ID of the server should now be the
@@ -13134,15 +13105,13 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-        assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::RetiredSource(
-                scid_1
-            ))),
-        );
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
+        let mut r = pipe.client.retired_scids();
+        assert_eq!(r.next(), Some(scid_1));
+        assert_eq!(r.next(), None);
 
         assert_eq!(pipe.server.destination_id(), scid_2);
+        assert_eq!(pipe.server.available_dcids(), 0);
 
         // Trying to remove the last DCID triggers an error.
         assert_eq!(
@@ -13191,14 +13160,7 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // At this point, the server should be notified that it has a new CID.
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::NewDestination(
-                1,
-                scid_1.clone(),
-                reset_token_1
-            )))
-        );
+        assert_eq!(pipe.server.available_dcids(), 1);
 
         // Now the server retires the first Destination CID.
         assert_eq!(pipe.server.retire_destination_cid(0), Ok(()));
@@ -13215,13 +13177,9 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
-        // Finally the client gets notified.
-        assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::RetiredSource(
-                scid
-            ))),
-        );
+        let mut r = pipe.client.retired_scids();
+        assert_eq!(r.next(), Some(scid));
+        assert_eq!(r.next(), None);
     }
 
     #[test]
@@ -13331,36 +13289,16 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
-        for i in 0..additional_cids {
-            if client_scid_len > 0 {
-                assert_eq!(
-                    pipe.server.poll(),
-                    Ok(QuicEvent::ConnectionId(
-                        ConnectionIdEvent::NewDestination(
-                            i as u64 + 1,
-                            c_cids[i].clone(),
-                            c_reset_tokens[i]
-                        )
-                    ))
-                );
-            }
-
-            if server_scid_len > 0 {
-                assert_eq!(
-                    pipe.client.poll(),
-                    Ok(QuicEvent::ConnectionId(
-                        ConnectionIdEvent::NewDestination(
-                            i as u64 + 1,
-                            s_cids[i].clone(),
-                            s_reset_tokens[i]
-                        )
-                    ))
-                );
-            }
+        if client_scid_len > 0 {
+            assert_eq!(pipe.server.available_dcids(), additional_cids,);
         }
 
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        if server_scid_len > 0 {
+            assert_eq!(pipe.client.available_dcids(), additional_cids,);
+        }
+
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
 
         pipe
     }
@@ -13415,24 +13353,10 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::NewDestination(
-                1,
-                c_cid,
-                c_reset_token
-            )))
-        );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-        assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::ConnectionId(ConnectionIdEvent::NewDestination(
-                1,
-                s_cid,
-                s_reset_token
-            )))
-        );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.available_dcids(), 1);
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.client.available_dcids(), 1);
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
 
         // Now the path probing can work.
         assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1),);
@@ -13447,38 +13371,28 @@ mod tests {
 
         // The path should be validated at some point.
         assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                client_addr_2,
-                server_addr
-            ))),
+            pipe.client.poll_path(),
+            Ok(PathEvent::Validated(client_addr_2, server_addr)),
         );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
 
         // The server should be notified of this new path.
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2))),
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, client_addr_2)),
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server.poll_path(),
+            Ok(PathEvent::Validated(server_addr, client_addr_2)),
+        );
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
 
-        // The server can also initiates path validation.
+        // The server can later probe the path again.
         assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1),);
 
-        assert_eq!(pipe.advance(), Ok(()));
-
         // This should not trigger any event at client side.
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
-
-        // But the path should be validated at server one.
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                server_addr,
-                client_addr_2
-            ))),
-        );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
     }
 
     #[test]
@@ -13530,64 +13444,21 @@ mod tests {
 
         // The path should be validated at some point.
         assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                client_addr_2,
-                server_addr
-            )))
+            pipe.client.poll_path(),
+            Ok(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
 
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-
-        // Now the server probes the address.
-        assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1),);
-
-        // It sends some packets to the client that are received...
-        testing::process_flight(
-            &mut pipe.client,
-            testing::emit_flight(&mut pipe.server).unwrap(),
-        )
-        .unwrap();
-
-        // But not the packets from the client to the server.
-        testing::emit_flight(&mut pipe.client).unwrap();
-
-        // Wait until probing timer expires. Since the RTT is very low,
-        // wait a bit more.
-        let probed_pid = pipe
-            .server
-            .path_mgr
-            .path_id_from_addrs(&(server_addr, client_addr_2))
-            .unwrap();
-        let probe_instant = pipe
-            .server
-            .path_mgr
-            .get(probed_pid)
-            .unwrap()
-            .recovery
-            .loss_detection_timer()
-            .unwrap();
-        let timer = probe_instant.duration_since(time::Instant::now());
-        std::thread::sleep(timer + time::Duration::from_millis(1));
-
-        pipe.server.on_timeout();
-
-        assert_eq!(pipe.advance(), Ok(()));
-
         // The path should be validated at some point.
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                server_addr,
-                client_addr_2
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::Validated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
     }
 
     #[test]
@@ -13638,11 +13509,8 @@ mod tests {
         }
 
         assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::Path(PathEvent::FailedValidation(
-                client_addr_2,
-                server_addr
-            ))),
+            pipe.client.poll_path(),
+            Ok(PathEvent::FailedValidation(client_addr_2, server_addr)),
         );
     }
 
@@ -13721,7 +13589,7 @@ mod tests {
             pipe.client.path_mgr.get(probed_pid).unwrap().validated(),
             false,
         );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         // Now let the client probe at its MTU.
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
@@ -13729,11 +13597,8 @@ mod tests {
             true,
         );
         assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                client_addr_2,
-                server_addr
-            )),)
+            pipe.client.poll_path(),
+            Ok(PathEvent::Validated(client_addr_2, server_addr))
         );
     }
 
@@ -13763,20 +13628,21 @@ mod tests {
 
         // The path should be validated at some point.
         assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                client_addr_2,
-                server_addr
-            )))
+            pipe.client.poll_path(),
+            Ok(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
 
         // The server should be notified of this new path.
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server.poll_path(),
+            Ok(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
 
         assert_eq!(pipe.server.path_mgr.paths().len(), 2);
 
@@ -13793,13 +13659,14 @@ mod tests {
             .expect("failed to process");
         assert_eq!(pipe.server.path_mgr.paths().len(), 2);
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::ReusedSourceConnectionId(
+            pipe.server.poll_path(),
+            Ok(PathEvent::ReusedSourceConnectionId(
                 1,
                 (server_addr, client_addr_2),
                 (server_addr, client_addr_3)
-            )))
+            ))
         );
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
     }
 
     #[test]
@@ -13994,34 +13861,21 @@ mod tests {
         assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                client_addr_2,
-                server_addr
-            )))
+            pipe.client.poll_path(),
+            Ok(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server.poll_path(),
+            Ok(PathEvent::Validated(server_addr, client_addr_2))
+        );
         assert_eq!(
             pipe.client.is_path_validated(client_addr_2, server_addr),
             Ok(true)
-        );
-        assert_eq!(
-            pipe.server.is_path_validated(server_addr, client_addr_2),
-            Ok(false)
-        );
-        assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1));
-        assert_eq!(pipe.advance(), Ok(()));
-        assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                server_addr,
-                client_addr_2
-            )))
         );
         assert_eq!(
             pipe.server.is_path_validated(server_addr, client_addr_2),
@@ -14052,13 +13906,10 @@ mod tests {
             server_addr
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
-                server_addr,
-                client_addr_2
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::PeerMigrated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
         assert_eq!(
             pipe.server
                 .path_mgr
@@ -14098,24 +13949,18 @@ mod tests {
             server_addr
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_3)))
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, client_addr_3))
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
-                server_addr,
-                client_addr_3
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::PeerMigrated(server_addr, client_addr_3))
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                server_addr,
-                client_addr_3
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::Validated(server_addr, client_addr_3))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
         assert_eq!(
             pipe.server
                 .path_mgr
@@ -14138,7 +13983,7 @@ mod tests {
         assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
         assert_eq!(pipe.client.stream_send(8, b"data", true), Ok(4));
         assert_eq!(pipe.advance(), Ok(()));
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         assert_eq!(
             pipe.client
                 .path_mgr
@@ -14155,7 +14000,7 @@ mod tests {
                 .peer_addr(),
             server_addr
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
         assert_eq!(
             pipe.server
                 .path_mgr
@@ -14245,24 +14090,18 @@ mod tests {
             server_addr
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
-                server_addr,
-                client_addr_2
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::PeerMigrated(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                server_addr,
-                client_addr_2
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::Validated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
         assert_eq!(
             pipe.server
                 .path_mgr
@@ -14311,28 +14150,19 @@ mod tests {
         assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
-            pipe.client.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                client_addr_2,
-                server_addr
-            )))
+            pipe.client.poll_path(),
+            Ok(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(pipe.client.poll_path(), Err(Error::Done));
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
-        assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1));
-        assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::Validated(
-                server_addr,
-                client_addr_2
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::Validated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
 
         // A first flight sent from secondary address.
         assert_eq!(pipe.client.stream_send(0, b"data", true), Ok(4));
@@ -14347,7 +14177,7 @@ mod tests {
 
         // Server does not perform connection migration because of packet
         // reordering.
-        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.poll_path(), Err(Error::Done));
         assert_eq!(
             pipe.server
                 .path_mgr
@@ -14409,26 +14239,20 @@ mod tests {
         );
         assert_eq!(pipe.server.stream_send(1, &buf[12000..], true), Ok(12000));
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::ReusedSourceConnectionId(
+            pipe.server.poll_path(),
+            Ok(PathEvent::ReusedSourceConnectionId(
                 0,
                 (server_addr, client_addr),
                 (server_addr, spoofed_client_addr)
-            )))
+            ))
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::New(
-                server_addr,
-                spoofed_client_addr
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::New(server_addr, spoofed_client_addr))
         );
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
-                server_addr,
-                spoofed_client_addr
-            )))
+            pipe.server.poll_path(),
+            Ok(PathEvent::PeerMigrated(server_addr, spoofed_client_addr))
         );
 
         assert_eq!(
@@ -14467,11 +14291,11 @@ mod tests {
         // Because of the small ACK size, the server cannot send more to the
         // client. Fallback on the previous active path.
         assert_eq!(
-            pipe.server.poll(),
-            Ok(QuicEvent::Path(PathEvent::FailedValidation(
+            pipe.server.poll_path(),
+            Ok(PathEvent::FailedValidation(
                 server_addr,
                 spoofed_client_addr
-            )))
+            ))
         );
 
         assert_eq!(
@@ -14495,7 +14319,7 @@ mod tests {
     }
 }
 
-pub use crate::cid::ConnectionIdEvent;
+pub use crate::cid::ConnectionIdIter;
 
 pub use crate::packet::ConnectionId;
 pub use crate::packet::Header;

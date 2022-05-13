@@ -43,9 +43,7 @@ use quiche_apps::args::*;
 
 use quiche_apps::common::*;
 
-use quiche::ConnectionIdEvent;
 use quiche::PathEvent;
-use quiche::QuicEvent;
 
 const MAX_BUF_SIZE: usize = 65535;
 
@@ -473,16 +471,10 @@ fn main() {
                 }
             }
 
-            // Handle QUIC events.
-            while let Ok(qe) = client.conn.poll() {
+            // Handle path events.
+            while let Ok(qe) = client.conn.poll_path() {
                 match qe {
-                    QuicEvent::ConnectionId(
-                        ConnectionIdEvent::RetiredSource(cid),
-                    ) => {
-                        info!("Retiring source CID {:?}", cid);
-                        clients_ids.remove(&cid);
-                    },
-                    QuicEvent::Path(PathEvent::New(local_addr, peer_addr)) => {
+                    PathEvent::New(local_addr, peer_addr) => {
                         info!("Seen new path ({}, {})", local_addr, peer_addr);
                         // Directly probe the new path.
                         client
@@ -490,60 +482,43 @@ fn main() {
                             .probe_path(local_addr, peer_addr)
                             .expect("cannot probe");
                     },
-                    QuicEvent::Path(PathEvent::Validated(
-                        local_addr,
-                        peer_addr,
-                    )) => {
+                    PathEvent::Validated(local_addr, peer_addr) => {
                         info!(
                             "Path ({}, {}) is now validated",
                             local_addr, peer_addr
                         );
                     },
-                    QuicEvent::Path(PathEvent::FailedValidation(
-                        local_addr,
-                        peer_addr,
-                    )) => {
+                    PathEvent::FailedValidation(local_addr, peer_addr) => {
                         info!(
                             "Path ({}, {}) failed validation",
                             local_addr, peer_addr
                         );
                     },
-                    QuicEvent::Path(PathEvent::Closed(local_addr, peer_addr)) => {
+                    PathEvent::Closed(local_addr, peer_addr) => {
                         info!(
                             "Path ({}, {}) is now closed and unusable",
                             local_addr, peer_addr
                         );
                     },
-                    QuicEvent::Path(PathEvent::ReusedSourceConnectionId(
-                        cid_seq,
-                        old,
-                        new,
-                    )) => {
+                    PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
                         info!(
                             "Peer reused cid seq {} (intially {:?}) on {:?}",
                             cid_seq, old, new
                         );
                     },
-                    QuicEvent::Path(PathEvent::PeerMigrated(
-                        local_addr,
-                        peer_addr,
-                    )) => {
+                    PathEvent::PeerMigrated(local_addr, peer_addr) => {
                         info!(
                             "Connection migrated to ({}, {})",
                             local_addr, peer_addr
                         );
                     },
-                    QuicEvent::ConnectionId(
-                        ConnectionIdEvent::NewDestination(seq, ..),
-                    ) => {
-                        info!("Received new destination CID with seq {}", seq);
-                    },
-                    QuicEvent::ConnectionId(
-                        ConnectionIdEvent::RetiredDestination(seq),
-                    ) => {
-                        info!("Retired destination CID with seq {}", seq);
-                    },
                 }
+            }
+
+            // See whether source Connection IDs have been retired.
+            for retired_scid in client.conn.retired_scids() {
+                info!("Retiring source CID {:?}", retired_scid);
+                clients_ids.remove(&retired_scid);
             }
 
             // Provides as many CIDs as possible.

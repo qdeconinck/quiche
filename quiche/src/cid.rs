@@ -32,20 +32,6 @@ use crate::packet::ConnectionId;
 
 use std::collections::VecDeque;
 
-/// A Connection Id-specific event.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ConnectionIdEvent {
-    /// The related `ConnectionId`, with the associated sequence number as
-    /// `u64` and stateless reset token as `u128`, can now be used to reach the
-    /// peer.
-    NewDestination(u64, ConnectionId<'static>, u128),
-    /// The related Connection ID with the associated sequence number as
-    /// `u64`, must be retired because the peer required us to do so.
-    RetiredDestination(u64),
-    /// The related Source `ConnectionId` has been retired by the peer.
-    RetiredSource(ConnectionId<'static>),
-}
-
 /// A structure holding a `ConnectionId` and all its related metadata.
 #[derive(Debug, Default)]
 pub struct ConnectionIdEntry {
@@ -203,6 +189,27 @@ impl BoundedNonEmptyConnectionIdVecDeque {
     }
 }
 
+/// An iterator over QUIC Connection IDs.
+pub struct ConnectionIdIter {
+    cids: VecDeque<ConnectionId<'static>>,
+}
+
+impl Iterator for ConnectionIdIter {
+    type Item = ConnectionId<'static>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.cids.pop_front()
+    }
+}
+
+impl ExactSizeIterator for ConnectionIdIter {
+    #[inline]
+    fn len(&self) -> usize {
+        self.cids.len()
+    }
+}
+
 #[derive(Default)]
 pub struct ConnectionIdentifiers {
     /// All the Destination Connection IDs provided by our peer.
@@ -215,9 +222,9 @@ pub struct ConnectionIdentifiers {
     /// Retired Destination Connection IDs that should be announced to the peer.
     retire_dcid_seqs: VecDeque<u64>,
 
-    /// All Connection ID related events that should be notified to the
+    /// Retired Source Connection IDs that should be notified to the
     /// application.
-    events: Option<VecDeque<ConnectionIdEvent>>,
+    retired_scids: Option<VecDeque<ConnectionId<'static>>>,
 
     /// Largest "Retire Prior To" we received from the peer.
     largest_peer_retire_prior_to: u64,
@@ -252,7 +259,7 @@ impl ConnectionIdentifiers {
         }
         // Initially, the limit of active source connection IDs is 2.
         let source_conn_id_limit = 2;
-        let events = if enable_events {
+        let retired_scids = if enable_events {
             Some(VecDeque::new())
         } else {
             None
@@ -282,12 +289,12 @@ impl ConnectionIdentifiers {
         // Because we already inserted the initial SCID.
         let next_scid_seq = 1;
         ConnectionIdentifiers {
-            source_conn_id_limit,
-            events,
             scids,
             dcids,
-            zero_length_scid,
+            retired_scids,
             next_scid_seq,
+            source_conn_id_limit,
+            zero_length_scid,
             ..Default::default()
         }
     }
@@ -484,18 +491,11 @@ impl ConnectionIdentifiers {
         // CONNECTION_ID_LIMIT_ERROR.
         if retire_prior_to > self.largest_peer_retire_prior_to {
             let retired = &mut self.retire_dcid_seqs;
-            let events = &mut self.events;
             self.dcids.remove_lower_than_and_insert(
                 retire_prior_to,
                 new_entry,
                 |e| {
                     retired.push_back(e.seq);
-                    // We also need to notify the application.
-                    if let Some(evs) = events {
-                        evs.push_back(ConnectionIdEvent::RetiredDestination(
-                            e.seq,
-                        ));
-                    }
 
                     if let Some(pid) = e.path_id {
                         retired_path_ids.push((e.seq, pid));
@@ -505,15 +505,6 @@ impl ConnectionIdentifiers {
             self.largest_peer_retire_prior_to = retire_prior_to;
         } else {
             self.dcids.insert(new_entry)?;
-        }
-
-        // Notifies the application.
-        if let Some(evs) = &mut self.events {
-            evs.push_back(ConnectionIdEvent::NewDestination(
-                seq,
-                cid,
-                reset_token,
-            ));
         }
 
         Ok(retired_path_ids)
@@ -541,8 +532,8 @@ impl ConnectionIdentifiers {
                 return Err(Error::InvalidState);
             }
             // Notifies the application.
-            if let Some(evs) = &mut self.events {
-                evs.push_back(ConnectionIdEvent::RetiredSource(e.cid));
+            if let Some(retired_dcids) = &mut self.retired_scids {
+                retired_dcids.push_back(e.cid);
             }
 
             // Retiring this SCID may increase the retire prior to.
@@ -660,6 +651,19 @@ impl ConnectionIdentifiers {
         self.scids.iter().filter(|e| e.path_id.is_none()).count()
     }
 
+    /// Returns the number of Destination Connectino IDs that have not been
+    /// assigned to a path yet.
+    ///
+    /// Note that this function returns 0 if the host uses zero length
+    /// Destination Connection IDs.
+    #[inline]
+    pub fn available_dcids(&self) -> usize {
+        if self.zero_length_dcid() {
+            return 0;
+        }
+        self.dcids.iter().filter(|e| e.path_id.is_none()).count()
+    }
+
     /// Returns the oldest active source Connection ID of this connection.
     #[inline]
     pub fn oldest_scid(&self) -> &ConnectionIdEntry {
@@ -754,12 +758,6 @@ impl ConnectionIdentifiers {
         self.zero_length_dcid
     }
 
-    /// Gets the first CID-related event to be notified to the application.
-    #[inline]
-    pub fn pop_event(&mut self) -> Option<ConnectionIdEvent> {
-        self.events.as_mut().and_then(|evs| evs.pop_front())
-    }
-
     /// Gets the NEW_CONNECTION_ID frame related to the source connection ID
     /// with sequence `seq_num`.
     pub fn get_new_connection_id_frame_for(
@@ -780,6 +778,16 @@ impl ConnectionIdentifiers {
     pub fn active_source_cids(&self) -> usize {
         self.scids.len()
     }
+
+    pub fn retired_scids(&mut self) -> ConnectionIdIter {
+        ConnectionIdIter {
+            cids: self
+                .retired_scids
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -794,9 +802,9 @@ mod tests {
 
         let mut ids = ConnectionIdentifiers::new(2, true, scid, 0, None);
         ids.set_source_conn_id_limit(3);
-        ids.set_initial_dcid(dcid, None, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
 
-        assert_eq!(ids.pop_event(), None);
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.available_scids(), 0);
         assert_eq!(ids.has_new_scids(), false);
         assert_eq!(ids.next_advertise_new_scid_seq(), None);
@@ -804,6 +812,7 @@ mod tests {
         let (scid2, rt2) = create_cid_and_reset_token(16);
 
         assert_eq!(ids.new_scid(scid2, Some(rt2), true, None, false), Ok(1));
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.available_scids(), 1);
         assert_eq!(ids.has_new_scids(), true);
         assert_eq!(ids.next_advertise_new_scid_seq(), Some(1));
@@ -811,6 +820,7 @@ mod tests {
         let (scid3, rt3) = create_cid_and_reset_token(16);
 
         assert_eq!(ids.new_scid(scid3, Some(rt3), true, None, false), Ok(2));
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.available_scids(), 2);
         assert_eq!(ids.has_new_scids(), true);
         assert_eq!(ids.next_advertise_new_scid_seq(), Some(1));
@@ -823,25 +833,25 @@ mod tests {
             ids.new_scid(scid4, Some(rt4), true, None, false),
             Err(Error::IdLimit),
         );
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.available_scids(), 2);
         assert_eq!(ids.has_new_scids(), true);
         assert_eq!(ids.next_advertise_new_scid_seq(), Some(1));
-        assert_eq!(ids.pop_event(), None);
 
         // Assume we sent one of them.
         ids.mark_advertise_new_scid_seq(1, false);
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.available_scids(), 2);
         assert_eq!(ids.has_new_scids(), true);
         assert_eq!(ids.next_advertise_new_scid_seq(), Some(2));
-        assert_eq!(ids.pop_event(), None);
 
         // Send the other.
         ids.mark_advertise_new_scid_seq(2, false);
 
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.available_scids(), 2);
         assert_eq!(ids.has_new_scids(), false);
         assert_eq!(ids.next_advertise_new_scid_seq(), None);
-        assert_eq!(ids.pop_event(), None);
     }
 
     #[test]
@@ -850,10 +860,9 @@ mod tests {
         let (dcid, _) = create_cid_and_reset_token(16);
 
         let mut ids = ConnectionIdentifiers::new(2, true, scid, 0, None);
-        ids.set_initial_dcid(dcid, None, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
 
-        assert_eq!(ids.pop_event(), None);
-
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.dcids.len(), 1);
 
         let (dcid2, rt2) = create_cid_and_reset_token(16);
@@ -862,11 +871,7 @@ mod tests {
             ids.new_dcid(dcid2.clone(), 1, rt2, 0),
             Ok(Vec::<(u64, usize)>::new()),
         );
-        assert_eq!(
-            ids.pop_event(),
-            Some(ConnectionIdEvent::NewDestination(1, dcid2, rt2))
-        );
-        assert_eq!(ids.pop_event(), None);
+        assert_eq!(ids.available_dcids(), 1);
         assert_eq!(ids.dcids.len(), 2);
 
         // Now we assume that the client wants to advertise more source
@@ -874,19 +879,10 @@ mod tests {
         // requests its peer to retire enough Connection IDs to fit within the
         // limits.
         let (dcid3, rt3) = create_cid_and_reset_token(16);
-        assert_eq!(
-            ids.new_dcid(dcid3.clone(), 2, rt3, 1),
-            Ok(Vec::<(u64, usize)>::new()),
-        );
-        assert_eq!(
-            ids.pop_event(),
-            Some(ConnectionIdEvent::RetiredDestination(0))
-        );
-        assert_eq!(
-            ids.pop_event(),
-            Some(ConnectionIdEvent::NewDestination(2, dcid3, rt3))
-        );
-        assert_eq!(ids.pop_event(), None);
+        assert_eq!(ids.new_dcid(dcid3.clone(), 2, rt3, 1), Ok(vec![(0, 0)]),);
+        // The CID module does not handle path replacing. Fake it now.
+        ids.link_dcid_to_path_id(1, 0).unwrap();
+        assert_eq!(ids.available_dcids(), 1);
         assert_eq!(ids.dcids.len(), 2);
         assert_eq!(ids.has_retire_dcids(), true);
         assert_eq!(ids.next_retire_dcid_seq(), Some(0));
@@ -904,7 +900,10 @@ mod tests {
         assert_eq!(ids.dcids.len(), 2);
 
         // Now it removes DCID with sequence 1.
-        assert_eq!(ids.retire_dcid(1), Ok(None));
+        assert_eq!(ids.retire_dcid(1), Ok(Some(0)));
+        // The CID module does not handle path replacing. Fake it now.
+        ids.link_dcid_to_path_id(2, 0).unwrap();
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.has_retire_dcids(), true);
         assert_eq!(ids.next_retire_dcid_seq(), Some(1));
         assert_eq!(ids.dcids.len(), 1);
@@ -916,7 +915,47 @@ mod tests {
 
         // Trying to remove the last DCID triggers an error.
         assert_eq!(ids.retire_dcid(2), Err(Error::OutOfIdentifiers));
+        assert_eq!(ids.available_dcids(), 0);
         assert_eq!(ids.has_retire_dcids(), false);
         assert_eq!(ids.dcids.len(), 1);
+    }
+
+    #[test]
+    fn retire_scids() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(3, true, scid.clone(), 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+        ids.set_source_conn_id_limit(3);
+
+        let (scid2, rt2) = create_cid_and_reset_token(16);
+        let (scid3, rt3) = create_cid_and_reset_token(16);
+
+        assert_eq!(
+            ids.new_scid(scid2.clone(), Some(rt2), true, None, false),
+            Ok(1),
+        );
+        assert_eq!(ids.scids.len(), 2);
+        assert_eq!(
+            ids.new_scid(scid3.clone(), Some(rt3), true, None, false),
+            Ok(2),
+        );
+        assert_eq!(ids.scids.len(), 3);
+
+        let mut retired = ids.retired_scids();
+        assert_eq!(retired.next(), None);
+
+        assert_eq!(ids.retire_scid(0, &scid2), Ok(Some(0)),);
+
+        let mut retired = ids.retired_scids();
+        assert_eq!(retired.next(), Some(scid));
+        assert_eq!(retired.next(), None);
+
+        assert_eq!(ids.retire_scid(1, &scid3), Ok(None),);
+
+        let mut retired = ids.retired_scids();
+        assert_eq!(retired.next(), Some(scid2));
+        assert_eq!(retired.next(), None);
     }
 }

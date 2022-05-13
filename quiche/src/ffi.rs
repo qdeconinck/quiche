@@ -844,19 +844,31 @@ pub extern fn quiche_conn_retire_destination_cid(
 }
 
 #[no_mangle]
-pub extern fn quiche_conn_poll(
-    conn: &mut Connection, ev: *mut *const QuicEvent,
+pub extern fn quiche_conn_poll_path(
+    conn: &mut Connection, ev: *mut *const PathEvent,
 ) -> i64 {
-    match conn.poll() {
-        Ok(qe) => {
+    match conn.poll_path() {
+        Ok(pe) => {
             unsafe {
-                *ev = Box::into_raw(Box::new(qe));
+                *ev = Box::into_raw(Box::new(pe));
             }
 
             0
         },
         Err(e) => e.to_c() as i64,
     }
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_retired_scids(
+    conn: &mut Connection,
+) -> *mut ConnectionIdIter {
+    Box::into_raw(Box::new(conn.retired_scids()))
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_available_dcids(conn: &Connection) -> u64 {
+    conn.available_dcids() as u64
 }
 
 #[no_mangle]
@@ -1175,6 +1187,27 @@ pub extern fn quiche_stream_iter_next(
 
 #[no_mangle]
 pub extern fn quiche_stream_iter_free(iter: *mut StreamIter) {
+    unsafe { Box::from_raw(iter) };
+}
+
+#[no_mangle]
+pub extern fn quiche_connection_id_iter_next(
+    iter: &mut ConnectionIdIter, scid: *mut u8, scid_len: *mut size_t,
+) -> bool {
+    if let Some(cid) = iter.next() {
+        let len = std::cmp::max(unsafe { *scid_len }, cid.len());
+        let mut cid_array: Vec<u8> = cid.into();
+        cid_array.truncate(len);
+        unsafe { *scid_len = len };
+        unsafe { std::ptr::copy(cid_array.as_ptr(), scid, len) };
+        return true;
+    }
+
+    false
+}
+
+#[no_mangle]
+pub extern fn quiche_connection_id_iter_free(iter: *mut ConnectionIdIter) {
     unsafe { Box::from_raw(iter) };
 }
 

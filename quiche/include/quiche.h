@@ -367,10 +367,10 @@ uint64_t quiche_conn_max_active_source_cids(quiche_conn *conn);
 // reach its peer.
 int64_t quiche_conn_retire_destination_cid(quiche_conn *conn, uint64_t dcid_seq);
 
-typedef struct QuicEvent quiche_quic_event;
+typedef struct PathEvent quiche_path_event;
 
-// Processes QUIC-specific events.
-int64_t quiche_conn_poll(quiche_conn *conn, quiche_quic_event **ev);
+// Processes path-specific events.
+int64_t quiche_conn_poll_path(quiche_conn *conn, quiche_path_event **ev);
 
 // Reads contiguous data from a stream.
 ssize_t quiche_conn_stream_recv(quiche_conn *conn, uint64_t stream_id,
