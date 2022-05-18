@@ -43,6 +43,8 @@ use std::cell::RefCell;
 
 use std::path;
 
+use ring::rand::SecureRandom;
+
 use quiche::ConnectionId;
 
 use quiche::h3::NameValue;
@@ -84,12 +86,14 @@ pub struct PartialResponse {
     pub written: usize,
 }
 
+pub type ClientId = u64;
+
 pub struct Client {
     pub conn: std::pin::Pin<Box<quiche::Connection>>,
 
     pub http_conn: Option<Box<dyn HttpConn>>,
 
-    pub id: u64,
+    pub client_id: ClientId,
 
     pub siduck_conn: Option<SiDuckConn>,
 
@@ -102,8 +106,8 @@ pub struct Client {
     pub bytes_sent: usize,
 }
 
-pub type ClientIdMap = HashMap<ConnectionId<'static>, u64>;
-pub type ClientMap = HashMap<u64, Client>;
+pub type ClientIdMap = HashMap<ConnectionId<'static>, ClientId>;
+pub type ClientMap = HashMap<ClientId, Client>;
 
 /// Makes a buffered writer for a resource with a target URL.
 ///
@@ -252,6 +256,19 @@ pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// Generate a new pair of Source Connection ID and reset token.
+pub fn generate_cid_and_reset_token<T: SecureRandom>(
+    rng: &T,
+) -> (quiche::ConnectionId<'static>, u128) {
+    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+    rng.fill(&mut scid).unwrap();
+    let scid = scid.to_vec().into();
+    let mut reset_token = [0; 16];
+    rng.fill(&mut reset_token).unwrap();
+    let reset_token = u128::from_be_bytes(reset_token);
+    (scid, reset_token)
 }
 
 pub trait HttpConn {

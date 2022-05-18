@@ -92,7 +92,7 @@ fn main() {
     config.set_initial_max_stream_data_uni(conn_args.max_stream_data);
     config.set_initial_max_streams_bidi(conn_args.max_streams_bidi);
     config.set_initial_max_streams_uni(conn_args.max_streams_uni);
-    config.set_disable_active_migration(!conn_args.migrate);
+    config.set_disable_active_migration(!conn_args.enable_active_migration);
     config.set_active_connection_id_limit(conn_args.max_active_cids);
     config.enable_events(true);
 
@@ -345,11 +345,11 @@ fn main() {
                     }
                 }
 
-                let id = next_client_id;
+                let client_id = next_client_id;
                 let client = Client {
                     conn,
                     http_conn: None,
-                    id,
+                    client_id,
                     partial_requests: HashMap::new(),
                     partial_responses: HashMap::new(),
                     siduck_conn: None,
@@ -357,11 +357,11 @@ fn main() {
                     bytes_sent: 0,
                 };
 
-                clients.insert(id, client);
-                clients_ids.insert(scid.clone(), id);
+                clients.insert(client_id, client);
+                clients_ids.insert(scid.clone(), client_id);
                 next_client_id += 1;
 
-                clients.get_mut(&id).unwrap()
+                clients.get_mut(&client_id).unwrap()
             } else {
                 let cid = match clients_ids.get(&hdr.dcid) {
                     Some(v) => v,
@@ -471,49 +471,7 @@ fn main() {
                 }
             }
 
-            // Handle path events.
-            while let Ok(qe) = client.conn.poll_path() {
-                match qe {
-                    PathEvent::New(local_addr, peer_addr) => {
-                        info!("Seen new path ({}, {})", local_addr, peer_addr);
-                        // Directly probe the new path.
-                        client
-                            .conn
-                            .probe_path(local_addr, peer_addr)
-                            .expect("cannot probe");
-                    },
-                    PathEvent::Validated(local_addr, peer_addr) => {
-                        info!(
-                            "Path ({}, {}) is now validated",
-                            local_addr, peer_addr
-                        );
-                    },
-                    PathEvent::FailedValidation(local_addr, peer_addr) => {
-                        info!(
-                            "Path ({}, {}) failed validation",
-                            local_addr, peer_addr
-                        );
-                    },
-                    PathEvent::Closed(local_addr, peer_addr) => {
-                        info!(
-                            "Path ({}, {}) is now closed and unusable",
-                            local_addr, peer_addr
-                        );
-                    },
-                    PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
-                        info!(
-                            "Peer reused cid seq {} (intially {:?}) on {:?}",
-                            cid_seq, old, new
-                        );
-                    },
-                    PathEvent::PeerMigrated(local_addr, peer_addr) => {
-                        info!(
-                            "Connection migrated to ({}, {})",
-                            local_addr, peer_addr
-                        );
-                    },
-                }
-            }
+            handle_path_events(client);
 
             // See whether source Connection IDs have been retired.
             for retired_scid in client.conn.retired_scids() {
@@ -533,7 +491,7 @@ fn main() {
                 {
                     break;
                 }
-                clients_ids.insert(scid, client.id);
+                clients_ids.insert(scid, client.client_id);
             }
         }
 
@@ -665,15 +623,68 @@ fn validate_token<'a>(
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
-/// Generate a new pair of Source Connection ID and reset token.
-fn generate_cid_and_reset_token<T: SecureRandom>(
-    rng: &T,
-) -> (quiche::ConnectionId<'static>, u128) {
-    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-    rng.fill(&mut scid).unwrap();
-    let scid = scid.to_vec().into();
-    let mut reset_token = [0; 16];
-    rng.fill(&mut reset_token).unwrap();
-    let reset_token = u128::from_be_bytes(reset_token);
-    (scid, reset_token)
+fn handle_path_events(client: &mut Client) {
+    while let Ok(qe) = client.conn.poll_path() {
+        match qe {
+            PathEvent::New(local_addr, peer_addr) => {
+                info!(
+                    "{} Seen new path ({}, {})",
+                    client.conn.trace_id(),
+                    local_addr,
+                    peer_addr
+                );
+                // Directly probe the new path.
+                client
+                    .conn
+                    .probe_path(local_addr, peer_addr)
+                    .expect("cannot probe");
+            },
+
+            PathEvent::Validated(local_addr, peer_addr) => {
+                info!(
+                    "{} Path ({}, {}) is now validated",
+                    client.conn.trace_id(),
+                    local_addr,
+                    peer_addr
+                );
+            },
+
+            PathEvent::FailedValidation(local_addr, peer_addr) => {
+                info!(
+                    "{} Path ({}, {}) failed validation",
+                    client.conn.trace_id(),
+                    local_addr,
+                    peer_addr
+                );
+            },
+
+            PathEvent::Closed(local_addr, peer_addr) => {
+                info!(
+                    "{} Path ({}, {}) is now closed and unusable",
+                    client.conn.trace_id(),
+                    local_addr,
+                    peer_addr
+                );
+            },
+
+            PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
+                info!(
+                    "{} Peer reused cid seq {} (intially {:?}) on {:?}",
+                    client.conn.trace_id(),
+                    cid_seq,
+                    old,
+                    new
+                );
+            },
+
+            PathEvent::PeerMigrated(local_addr, peer_addr) => {
+                info!(
+                    "{} Connection migrated to ({}, {})",
+                    client.conn.trace_id(),
+                    local_addr,
+                    peer_addr
+                );
+            },
+        }
+    }
 }
