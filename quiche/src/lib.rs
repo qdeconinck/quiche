@@ -1562,6 +1562,14 @@ impl Default for QlogInfo {
     }
 }
 
+fn addr_tuple_to_string(from: SocketAddr, to: SocketAddr) -> String {
+    if from.ip().is_unspecified() || to.ip().is_unspecified() {
+        "".to_string()
+    } else {
+        format!(" ({} -> {})", from, to)
+    }
+}
+
 impl Connection {
     fn new(
         scid: ConnectionId<'static>, odcid: Option<&ConnectionId>,
@@ -2363,11 +2371,12 @@ impl Connection {
         let pn_len = hdr.pkt_num_len;
 
         trace!(
-            "{} rx pkt {:?} len={} pn={}",
+            "{} rx pkt {:?} len={} pn={}{}",
             self.trace_id,
             hdr,
             payload_len,
-            pn
+            pn,
+            addr_tuple_to_string(info.from, info.to)
         );
 
         #[cfg(feature = "qlog")]
@@ -4024,11 +4033,15 @@ impl Connection {
         }
 
         trace!(
-            "{} tx pkt {} len={} pn={}",
+            "{} tx pkt {} len={} pn={}{}",
             self.trace_id,
             hdr_trace.unwrap_or_else(|| "".to_string()),
             payload_len,
-            pn
+            pn,
+            addr_tuple_to_string(
+                self.path_mgr.get(send_pid)?.local_addr(),
+                self.path_mgr.get(send_pid)?.peer_addr()
+            )
         );
 
         #[cfg(feature = "qlog")]
