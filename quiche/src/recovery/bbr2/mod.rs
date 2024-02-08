@@ -729,7 +729,7 @@ mod tests {
         // Send 5 packets.
         for pn in 0..5 {
             let pkt = Sent {
-                pkt_num: recovery::SpacedPktNum(0, pn),
+                pkt_num: SpacedPktNum(0, pn),
                 frames: smallvec![],
                 time_sent: now,
                 time_acked: None,
@@ -799,7 +799,7 @@ mod tests {
         // Send 5 packets.
         for pn in 0..5 {
             let pkt = Sent {
-                pkt_num: recovery::SpacedPktNum(0, pn),
+                pkt_num: SpacedPktNum(0, pn),
                 frames: smallvec![],
                 time_sent: now,
                 time_acked: None,
@@ -872,7 +872,7 @@ mod tests {
         // Stop right before filled_pipe=true.
         for _ in 0..3 {
             let pkt = Sent {
-                pkt_num: recovery::SpacedPktNum(0, pn),
+                pkt_num: SpacedPktNum(0, pn),
                 frames: smallvec![],
                 time_sent: now,
                 time_acked: None,
@@ -923,7 +923,7 @@ mod tests {
         // Stop at right before filled_pipe=true.
         for _ in 0..5 {
             let pkt = Sent {
-                pkt_num: recovery::SpacedPktNum(0, pn),
+                pkt_num: SpacedPktNum(0, pn),
                 frames: smallvec![],
                 time_sent: now,
                 time_acked: None,
@@ -996,7 +996,7 @@ mod tests {
         // smaller than BBRInFlight(1).
         for _ in 0..4 {
             let pkt = Sent {
-                pkt_num: recovery::SpacedPktNum(0, pn),
+                pkt_num: SpacedPktNum(0, pn),
                 frames: smallvec![],
                 time_sent: now,
                 time_acked: None,
@@ -1050,7 +1050,7 @@ mod tests {
         let now = now + PROBE_RTT_INTERVAL;
 
         let pkt = Sent {
-            pkt_num: recovery::SpacedPktNum(0, pn),
+            pkt_num: SpacedPktNum(0, pn),
             frames: smallvec![],
             time_sent: now,
             time_acked: None,
