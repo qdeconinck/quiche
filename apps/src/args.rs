@@ -57,7 +57,7 @@ pub struct CommonArgs {
     pub qpack_max_table_capacity: Option<u64>,
     pub qpack_blocked_streams: Option<u64>,
     pub initial_cwnd_packets: u64,
-    pub multipath: bool,
+    pub initial_max_paths: Option<u64>,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -84,7 +84,8 @@ pub struct CommonArgs {
 /// --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 /// --initial-cwnd-packets      Size of initial congestion window, in packets.
-/// --multipath                 Enable multipath support.
+/// --initial-max-paths         Enable multipath support up to the number of
+/// paths.
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -196,7 +197,11 @@ impl Args for CommonArgs {
             .parse::<u64>()
             .unwrap();
 
-        let multipath = args.get_bool("--multipath");
+        let initial_max_paths = if args.get_str("--initial-max-paths") != "" {
+            Some(args.get_str("--initial-max-paths").parse::<u64>().unwrap())
+        } else {
+            None
+        };
 
         CommonArgs {
             alpns,
@@ -221,7 +226,7 @@ impl Args for CommonArgs {
             qpack_max_table_capacity,
             qpack_blocked_streams,
             initial_cwnd_packets,
-            multipath,
+            initial_max_paths,
         }
     }
 }
@@ -251,7 +256,7 @@ impl Default for CommonArgs {
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             initial_cwnd_packets: 10,
-            multipath: false,
+            initial_max_paths: None,
         }
     }
 }
@@ -289,7 +294,7 @@ Options:
   --max-active-cids NUM    The maximum number of active Connection IDs we can support [default: 2].
   --enable-active-migration   Enable active connection migration.
   --perform-migration      Perform connection migration on another source port.
-  --multipath              Enable multipath support.
+  --initial-max-paths NUM  Enable multipath support up to the number of paths.
   -A --address ADDR ...    Specify addresses to be used instead of the unspecified address. Non-routable addresses will lead to connectivity issues.
   -R --rm-addr TIMEADDR ...   Specify addresses to stop using after the provided time (format time,addr).
   -S --status TIMEADDRSTAT ...   Specify availability status to advertise to the peer after the provided time (format time,addr,available).
@@ -537,7 +542,7 @@ Options:
   --disable-gso               Disable GSO (linux only).
   --disable-pacing            Disable pacing (linux only).
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
-  --multipath                 Enable multipath support.
+  --initial-max-paths NUM     Enable multipath support up to the number of paths.
   -h --help                   Show this screen.
 ";
 

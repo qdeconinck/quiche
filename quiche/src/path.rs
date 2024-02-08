@@ -34,7 +34,9 @@ use smallvec::SmallVec;
 
 use slab::Slab;
 
+use crate::CIDSeq;
 use crate::Error;
+use crate::PathId;
 use crate::Result;
 
 use crate::recovery;
@@ -159,7 +161,7 @@ pub enum PathEvent {
     /// number, initially used by the peer over the first pair of `SocketAddr`s,
     /// is now reused over the second pair of `SocketAddr`s.
     ReusedSourceConnectionId(
-        u64,
+        CIDSeq,
         (SocketAddr, SocketAddr),
         (SocketAddr, SocketAddr),
     ),
@@ -177,6 +179,9 @@ pub enum PathEvent {
 
 /// A network path on which QUIC packets can be sent.
 pub struct Path {
+    /// The explicit path ID in multipath.
+    path_id: PathId,
+
     /// The local address.
     local_addr: SocketAddr,
 
@@ -274,7 +279,7 @@ impl Path {
     /// Create a new Path instance with the provided addresses, the remaining of
     /// the fields being set to their default value.
     pub fn new(
-        local_addr: SocketAddr, peer_addr: SocketAddr,
+        path_id: PathId, local_addr: SocketAddr, peer_addr: SocketAddr,
         recovery_config: &recovery::RecoveryConfig,
         path_challenge_recv_max_queue_len: usize, is_initial: bool,
     ) -> Self {
@@ -285,6 +290,7 @@ impl Path {
         };
 
         Self {
+            path_id,
             local_addr,
             peer_addr,
             active_scid_seq,
@@ -352,6 +358,12 @@ impl Path {
         self.active() ||
             (self.validation_state == PathValidationState::Validated &&
                 self.active_dcid_seq.is_some())
+    }
+
+    /// Returns the path ID of the network path.
+    #[inline]
+    pub fn path_id(&self) -> PathId {
+        self.path_id
     }
 
     /// Returns whether the path is unused.
@@ -494,9 +506,6 @@ impl Path {
 
     pub fn on_closing_timeout(&mut self) {
         self.closing_timer = None;
-        if let PathState::Closing(e, r) = &mut self.state {
-            self.state = PathState::Closed(*e, std::mem::take(r));
-        }
     }
 
     pub fn closing_error_code_and_reason(&self) -> Result<(u64, Vec<u8>)> {
@@ -615,6 +624,7 @@ impl Path {
 
     pub fn stats(&self) -> PathStats {
         PathStats {
+            path_id: self.path_id,
             local_addr: self.local_addr,
             peer_addr: self.peer_addr,
             validation_state: self.validation_state,
@@ -679,7 +689,7 @@ pub struct PathMap {
     addrs_to_paths: BTreeMap<(SocketAddr, SocketAddr), usize>,
 
     /// Path-specific events to be notified to the application.
-    events: VecDeque<PathEvent>,
+    events: VecDeque<(PathId, PathEvent)>,
 
     /// Whether this manager serves a connection as a server.
     is_server: bool,
@@ -816,6 +826,18 @@ impl PathMap {
         self.addrs_to_paths.get(addrs).copied()
     }
 
+    /// Returns the internal active `Path` identifier related to the explicit
+    /// PathId.
+    #[inline]
+    pub fn pid_from_path_id(&self, path_id: PathId) -> Option<usize> {
+        self.paths
+            .iter()
+            .find(|(_, p)| {
+                p.path_id() == path_id && (self.multipath || p.active())
+            })
+            .map(|(pid, _)| pid)
+    }
+
     /// Checks if creating a new path will not exceed the current `self.paths`
     /// capacity. If yes, this method tries to remove one unused path. If it
     /// fails to do so, returns [`Done`].
@@ -836,12 +858,15 @@ impl PathMap {
         self.addrs_to_paths
             .remove(&(path.local_addr, path.peer_addr));
 
-        self.notify_event(PathEvent::Closed(
-            path.local_addr,
-            path.peer_addr,
-            0,
-            "unused path".into(),
-        ));
+        self.notify_event(
+            path.path_id,
+            PathEvent::Closed(
+                path.local_addr,
+                path.peer_addr,
+                0,
+                "unused path".into(),
+            ),
+        );
 
         Ok(())
     }
@@ -881,6 +906,7 @@ impl PathMap {
     pub fn insert_path(&mut self, path: Path, is_server: bool) -> Result<usize> {
         self.make_room_for_new_path()?;
 
+        let path_id = path.path_id;
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
 
@@ -889,19 +915,19 @@ impl PathMap {
 
         // Notifies the application if we are in server mode.
         if is_server {
-            self.notify_event(PathEvent::New(local_addr, peer_addr));
+            self.notify_event(path_id, PathEvent::New(local_addr, peer_addr));
         }
 
         Ok(pid)
     }
 
     /// Notifies a path event to the application served by the connection.
-    pub fn notify_event(&mut self, ev: PathEvent) {
-        self.events.push_back(ev);
+    pub fn notify_event(&mut self, path_id: PathId, ev: PathEvent) {
+        self.events.push_back((path_id, ev));
     }
 
     /// Gets the first path event to be notified to the application.
-    pub fn pop_event(&mut self) -> Option<PathEvent> {
+    pub fn pop_event(&mut self) -> Option<(PathId, PathEvent)> {
         self.events.pop_front()
     }
 
@@ -913,9 +939,9 @@ impl PathMap {
             .filter(|(_, p)| p.validation_failed() && !p.failure_notified);
 
         for (_, p) in validation_failed {
-            self.events.push_back(PathEvent::FailedValidation(
-                p.local_addr,
-                p.peer_addr,
+            self.events.push_back((
+                p.path_id(),
+                PathEvent::FailedValidation(p.local_addr, p.peer_addr),
             ));
 
             p.failure_notified = true;
@@ -930,11 +956,9 @@ impl PathMap {
             .filter(|(_, p)| p.closed() && !p.failure_notified)
         {
             if let PathState::Closed(e, r) = &p.state {
-                events.push_back(PathEvent::Closed(
-                    p.local_addr,
-                    p.peer_addr,
-                    *e,
-                    r.clone(),
+                events.push_back((
+                    p.path_id(),
+                    PathEvent::Closed(p.local_addr, p.peer_addr, *e, r.clone()),
                 ));
                 p.failure_notified = true;
             }
@@ -964,6 +988,7 @@ impl PathMap {
 
         if let Some((pid, p)) = challenge_pending {
             if p.on_response_received(data) {
+                let path_id = p.path_id;
                 let local_addr = p.local_addr;
                 let peer_addr = p.peer_addr;
                 let was_migrating = p.migrating;
@@ -971,14 +996,18 @@ impl PathMap {
                 p.migrating = false;
 
                 // Notifies the application.
-                self.notify_event(PathEvent::Validated(local_addr, peer_addr));
+                self.notify_event(
+                    path_id,
+                    PathEvent::Validated(local_addr, peer_addr),
+                );
 
                 // If this path was the candidate for migration, notifies the
                 // application.
                 if pid == active_pid && was_migrating {
-                    self.notify_event(PathEvent::PeerMigrated(
-                        local_addr, peer_addr,
-                    ));
+                    self.notify_event(
+                        path_id,
+                        PathEvent::PeerMigrated(local_addr, peer_addr),
+                    );
                 }
             }
         }
@@ -986,30 +1015,52 @@ impl PathMap {
     }
 
     /// Handles acknowledged PATH_ABANDONs.
-    pub fn on_path_abandon_acknowledged(&mut self, abandon_path_id: usize) {
-        if let Ok(path) = self.get_mut(abandon_path_id) {
-            let local_addr = path.local_addr;
-            let peer_addr = path.peer_addr;
-            let to_notify = if let PathState::Closing(e, r) = &mut path.state {
-                let to_notify = Some((*e, r.clone()));
-                path.state = PathState::Closed(*e, std::mem::take(r));
-                to_notify
-            } else {
-                None
-            };
-            if let Some((e, r)) = to_notify {
-                self.notify_event(PathEvent::Closed(local_addr, peer_addr, e, r));
-            }
+    pub fn on_path_abandon_acknowledged(
+        &mut self, abandon_path_id: PathId, now: time::Instant, trace_id: &str,
+    ) -> (usize, usize) {
+        let abandon_pid = match self.pid_from_path_id(abandon_path_id) {
+            Some(pid) => pid,
+            None => return (0, 0),
+        };
+        let path = match self.get_mut(abandon_pid) {
+            Ok(p) => p,
+            Err(_) => return (0, 0),
+        };
+
+        let path_id = path.path_id;
+        let local_addr = path.local_addr;
+        let peer_addr = path.peer_addr;
+        let to_notify = if let PathState::Closing(e, r) = &mut path.state {
+            let to_notify = Some((*e, r.clone()));
+            path.state = PathState::Closed(*e, std::mem::take(r));
+            to_notify
+        } else {
+            None
+        };
+        let lost_info = path.recovery.mark_all_inflight_as_lost(now, trace_id);
+        if let Some((e, r)) = to_notify {
+            self.notify_event(
+                path_id,
+                PathEvent::Closed(local_addr, peer_addr, e, r),
+            );
         }
+        lost_info
     }
 
     /// Handles incoming PATH_ABANDONs.
     pub fn on_path_abandon_received(
-        &mut self, abandon_path_id: usize, error_code: u64, reason: Vec<u8>,
+        &mut self, abandon_path_id: PathId, error_code: u64, reason: Vec<u8>,
     ) -> Result<()> {
         let is_server = self.is_server;
         let nb_paths = self.paths.len();
-        let abandon_path = self.get_mut(abandon_path_id)?;
+        let abandon_pid = match self.pid_from_path_id(abandon_path_id) {
+            Some(pid) => pid,
+            None => {
+                warn!("Received path abandon for path_id {}, but it is unknown; ingore PathAbandon", abandon_path_id);
+                return Ok(());
+            },
+        };
+        let abandon_path = self.get_mut(abandon_pid)?;
         // If we are the server, and receiving a PATH_ABANDON for the only
         // active path, request a connection closure.
         if is_server && nb_paths == 1 {
@@ -1023,7 +1074,7 @@ impl PathMap {
         abandon_path.set_state(PathState::Closing(error_code, reason))?;
         abandon_path.on_abandon_received();
         if !was_closing {
-            self.mark_path_abandon(abandon_path_id, true);
+            self.mark_path_abandon(abandon_pid, true);
         }
         Ok(())
     }
@@ -1105,7 +1156,10 @@ impl PathMap {
             if new_active_path.validated() && !multipath {
                 let local_addr = new_active_path.local_addr();
                 let peer_addr = new_active_path.peer_addr();
-                self.notify_event(PathEvent::PeerMigrated(local_addr, peer_addr));
+                self.notify_event(
+                    0,
+                    PathEvent::PeerMigrated(local_addr, peer_addr),
+                );
             } else if !new_active_path.validated() {
                 new_active_path.migrating = !multipath;
                 // Requests path validation if needed.
@@ -1155,16 +1209,28 @@ impl PathMap {
         self.path_status_to_advertise.pop_front();
     }
 
+    /// Are all paths in standby state?
+    pub fn all_available_paths_standby(&self) -> bool {
+        !self.paths.iter().all(|p| p.1.active() && !p.1.is_standby())
+    }
+
     /// Handles the reception of PATH_STANDBY/PATH_AVAILABLE.
     pub fn on_path_status_received(
-        &mut self, path_id: usize, seq_num: u64, available: bool,
+        &mut self, path_id: PathId, seq_num: u64, available: bool,
     ) {
-        if let Ok(p) = self.get_mut(path_id) {
+        let pid = match self.pid_from_path_id(path_id) {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(p) = self.get_mut(pid) {
             if seq_num >= p.expected_path_status_seq_num {
                 p.expected_path_status_seq_num = seq_num.saturating_add(1);
+                let path_id = p.path_id();
                 let addr = (p.local_addr(), p.peer_addr());
-                self.events
-                    .push_back(PathEvent::PeerPathStatus(addr, available.into()));
+                self.notify_event(
+                    path_id,
+                    PathEvent::PeerPathStatus(addr, available.into()),
+                );
             }
         }
     }
@@ -1177,6 +1243,9 @@ impl PathMap {
 /// [`stats()`]: struct.Connection.html#method.stats
 #[derive(Clone)]
 pub struct PathStats {
+    /// The explicit path ID of the path, if doing multipath.
+    pub path_id: PathId,
+
     /// The local address of the path.
     pub local_addr: SocketAddr,
 
@@ -1254,8 +1323,8 @@ impl std::fmt::Debug for PathStats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "local_addr={:?} peer_addr={:?} ",
-            self.local_addr, self.peer_addr,
+            "path_id={:x} local_addr={:?} peer_addr={:?} ",
+            self.path_id, self.local_addr, self.peer_addr,
         )?;
         write!(
             f,
@@ -1302,6 +1371,7 @@ mod tests {
         let recovery_config = RecoveryConfig::from_config(&config);
 
         let path = Path::new(
+            0,
             client_addr,
             server_addr,
             &recovery_config,
@@ -1311,6 +1381,7 @@ mod tests {
         let mut path_mgr = PathMap::new(path, 2, false);
 
         let probed_path = Path::new(
+            0,
             client_addr_2,
             server_addr,
             &recovery_config,
@@ -1380,7 +1451,7 @@ mod tests {
         );
         assert_eq!(
             path_mgr.pop_event(),
-            Some(PathEvent::Validated(client_addr_2, server_addr))
+            Some((0, PathEvent::Validated(client_addr_2, server_addr)))
         );
     }
 
@@ -1393,6 +1464,7 @@ mod tests {
         let recovery_config = RecoveryConfig::from_config(&config);
 
         let path = Path::new(
+            0,
             client_addr,
             server_addr,
             &recovery_config,
@@ -1401,6 +1473,7 @@ mod tests {
         );
         let mut client_path_mgr = PathMap::new(path, 2, false);
         let mut server_path = Path::new(
+            0,
             server_addr,
             client_addr,
             &recovery_config,
@@ -1483,6 +1556,7 @@ mod tests {
         let recovery_config = RecoveryConfig::from_config(&config);
 
         let path = Path::new(
+            0,
             client_addr,
             server_addr,
             &recovery_config,
@@ -1491,6 +1565,7 @@ mod tests {
         );
         let mut client_path_mgr = PathMap::new(path, 2, false);
         let mut server_path = Path::new(
+            0,
             server_addr,
             client_addr,
             &recovery_config,
@@ -1632,6 +1707,7 @@ mod tests {
         let recovery_config = RecoveryConfig::from_config(&config);
 
         let path = Path::new(
+            0,
             client_addr,
             server_addr,
             &recovery_config,
@@ -1644,6 +1720,7 @@ mod tests {
             .unwrap();
 
         let path_2 = Path::new(
+            2,
             client_addr_2,
             server_addr,
             &recovery_config,
@@ -1652,6 +1729,7 @@ mod tests {
         );
         let pid_2 = paths.insert_path(path_2, false).unwrap();
         let path_3 = Path::new(
+            4,
             client_addr_3,
             server_addr,
             &recovery_config,

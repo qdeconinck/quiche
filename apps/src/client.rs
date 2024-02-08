@@ -127,7 +127,9 @@ pub fn connect(
     config.set_initial_max_streams_uni(conn_args.max_streams_uni);
     config.set_disable_active_migration(!conn_args.enable_active_migration);
     config.set_active_connection_id_limit(conn_args.max_active_cids);
-    config.set_multipath(conn_args.multipath);
+    if let Some(initial_max_paths) = conn_args.initial_max_paths {
+        config.set_initial_max_paths(initial_max_paths);
+    }
 
     config.set_max_connection_window(conn_args.max_window);
     config.set_max_stream_window(conn_args.max_stream_window);
@@ -412,14 +414,14 @@ pub fn connect(
         }
 
         // Handle path events.
-        while let Some(qe) = conn.path_event_next() {
+        while let Some((pid, qe)) = conn.path_event_next() {
             match qe {
                 quiche::PathEvent::New(..) => unreachable!(),
 
                 quiche::PathEvent::Validated(local_addr, peer_addr) => {
                     info!(
-                        "Path ({}, {}) is now validated",
-                        local_addr, peer_addr
+                        "Path ({}, {}) with ID {} is now validated",
+                        local_addr, peer_addr, pid
                     );
                     if conn.is_multipath_enabled() {
                         conn.set_active(local_addr, peer_addr, true).ok();
@@ -431,15 +433,15 @@ pub fn connect(
 
                 quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
                     info!(
-                        "Path ({}, {}) failed validation",
-                        local_addr, peer_addr
+                        "Path ({}, {}) with ID {} failed validation",
+                        local_addr, peer_addr, pid
                     );
                 },
 
                 quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
                     info!(
-                        "Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
-                        local_addr, peer_addr, e, reason
+                        "Path ({}, {}) with ID {} is now closed and unusable; err = {}, reason = {:?}",
+                        local_addr, peer_addr, pid, e, reason
                     );
                 },
 
@@ -449,8 +451,8 @@ pub fn connect(
                     new,
                 ) => {
                     info!(
-                        "Peer reused cid seq {} (initially {:?}) on {:?}",
-                        cid_seq, old, new
+                        "Peer reused cid seq {} (initially {:?}) on {:?}, path ID {}",
+                        cid_seq, old, new, pid
                     );
                 },
 
@@ -461,22 +463,31 @@ pub fn connect(
         }
 
         // See whether source Connection IDs have been retired.
-        while let Some(retired_scid) = conn.retired_scid_next() {
-            info!("Retiring source CID {:?}", retired_scid);
+        while let Some((path_id, retired_scid)) = conn.retired_scid_on_path_next()
+        {
+            info!(
+                "Retiring source CID {:?} from path_id {}",
+                retired_scid, path_id
+            );
         }
 
         // Provides as many CIDs as possible.
-        while conn.scids_left() > 0 {
-            let (scid, reset_token) = generate_cid_and_reset_token(&rng);
+        for path_id in conn.path_ids() {
+            while conn.scids_left_on_path(path_id) > 0 {
+                let (scid, reset_token) = generate_cid_and_reset_token(&rng);
 
-            if conn.new_scid(&scid, reset_token, false).is_err() {
-                break;
+                if conn
+                    .new_scid_on_path(path_id, &scid, reset_token, false)
+                    .is_err()
+                {
+                    break;
+                }
+
+                scid_sent = true;
             }
-
-            scid_sent = true;
         }
 
-        if conn_args.multipath &&
+        if conn_args.initial_max_paths.is_some() &&
             probed_paths < addrs.len() &&
             conn.available_dcids() > 0 &&
             conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
@@ -484,7 +495,7 @@ pub fn connect(
             probed_paths += 1;
         }
 
-        if !conn_args.multipath &&
+        if conn_args.initial_max_paths.is_none() &&
             args.perform_migration &&
             !new_path_probed &&
             scid_sent &&

@@ -122,7 +122,9 @@ fn main() {
     config.set_initial_congestion_window_packets(
         usize::try_from(conn_args.initial_cwnd_packets).unwrap(),
     );
-    config.set_multipath(conn_args.multipath);
+    if let Some(initial_max_paths) = conn_args.initial_max_paths {
+        config.set_initial_max_paths(initial_max_paths);
+    }
 
     config.set_max_connection_window(conn_args.max_window);
     config.set_max_stream_window(conn_args.max_stream_window);
@@ -510,14 +512,20 @@ fn main() {
                 clients_ids.remove(&retired_scid);
             }
 
-            // Provides as many CIDs as possible.
-            while client.conn.scids_left() > 0 {
-                let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-                if client.conn.new_scid(&scid, reset_token, false).is_err() {
-                    break;
-                }
+            for path_id in client.conn.path_ids() {
+                // Provides as many CIDs as possible.
+                while client.conn.scids_left_on_path(path_id) > 0 {
+                    let (scid, reset_token) = generate_cid_and_reset_token(&rng);
+                    if client
+                        .conn
+                        .new_scid_on_path(path_id, &scid, reset_token, false)
+                        .is_err()
+                    {
+                        break;
+                    }
 
-                clients_ids.insert(scid, client.client_id);
+                    clients_ids.insert(scid, client.client_id);
+                }
             }
         }
 
@@ -700,14 +708,15 @@ fn validate_token<'a>(
 }
 
 fn handle_path_events(client: &mut Client) {
-    while let Some(qe) = client.conn.path_event_next() {
+    while let Some((pid, qe)) = client.conn.path_event_next() {
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
                 info!(
-                    "{} Seen new path ({}, {})",
+                    "{} Seen new path ({}, {}) with ID {}",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
 
                 // Directly probe the new path.
@@ -720,10 +729,11 @@ fn handle_path_events(client: &mut Client) {
 
             quiche::PathEvent::Validated(local_addr, peer_addr) => {
                 info!(
-                    "{} Path ({}, {}) is now validated",
+                    "{} Path ({}, {}) with ID {} is now validated",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
                 if client.conn.is_multipath_enabled() {
                     client
@@ -736,19 +746,21 @@ fn handle_path_events(client: &mut Client) {
 
             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
                 info!(
-                    "{} Path ({}, {}) failed validation",
+                    "{} Path ({}, {}) with ID {} failed validation",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
             },
 
             quiche::PathEvent::Closed(local_addr, peer_addr, err, reason) => {
                 info!(
-                    "{} Path ({}, {}) is now closed and unusable; err = {} reason = {:?}",
+                    "{} Path ({}, {}) with ID {} is now closed and unusable; err = {} reason = {:?}",
                     client.conn.trace_id(),
                     local_addr,
                     peer_addr,
+                    pid,
                     err,
                     reason,
                 );
@@ -756,25 +768,30 @@ fn handle_path_events(client: &mut Client) {
 
             quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
                 info!(
-                    "{} Peer reused cid seq {} (initially {:?}) on {:?}",
+                    "{} Peer reused cid seq {} (initially {:?}) on {:?} on path ID {}",
                     client.conn.trace_id(),
                     cid_seq,
                     old,
-                    new
+                    new,
+                    pid
                 );
             },
 
             quiche::PathEvent::PeerMigrated(local_addr, peer_addr) => {
                 info!(
-                    "{} Connection migrated to ({}, {})",
+                    "{} Connection migrated to ({}, {}) on Path ID {}",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
             },
 
             quiche::PathEvent::PeerPathStatus(addr, path_status) => {
-                info!("Peer asks status {:?} for {:?}", path_status, addr,);
+                info!(
+                    "Peer asks status {:?} for {:?} on path ID {}",
+                    path_status, addr, pid
+                );
                 client
                     .conn
                     .set_path_status(addr.0, addr.1, path_status, false)
