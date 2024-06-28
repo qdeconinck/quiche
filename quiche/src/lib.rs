@@ -3055,13 +3055,13 @@ impl Connection {
                         }
                     },
 
-                    frame::Frame::ACKMP {
+                    frame::Frame::MPACK {
                         space_identifier,
                         ranges,
                         ..
                     } => {
                         // Stop acknowledging packets less than or equal to the
-                        // largest acknowledged in the sent ACK_MP frame that,
+                        // largest acknowledged in the sent MP_ACK frame that,
                         // in turn, got acked.
                         if let Some(largest_acked) = ranges.last() {
                             self.pkt_num_spaces
@@ -3609,7 +3609,7 @@ impl Connection {
                         self.ids.mark_retire_dcid_seq(path_id, seq_num, true);
                     },
 
-                    frame::Frame::ACKMP {
+                    frame::Frame::MPACK {
                         space_identifier, ..
                     } => {
                         self.pkt_num_spaces
@@ -3826,14 +3826,14 @@ impl Connection {
             }
         }
 
-        // Create ACK_MP frames if needed.
+        // Create MP_ACK frames if needed.
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
             path.active()
         {
-            // We first check if we should bundle the ACK_MP belonging to our
-            // path. We only bundle additional ACK_MP from other paths if we
-            // need to send one. This avoids sending ACK_MP frames endlessly.
+            // We first check if we should bundle the MP_ACK belonging to our
+            // path. We only bundle additional MP_ACK from other paths if we
+            // need to send one. This avoids sending MP_ACK frames endlessly.
             let mut wrote_ack_mp = false;
             let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
             if pns.recv_pkt_need_ack.len() > 0 &&
@@ -3846,7 +3846,7 @@ impl Connection {
                         self.local_transport_params.ack_delay_exponent as u32,
                     );
 
-                let frame = frame::Frame::ACKMP {
+                let frame = frame::Frame::MPACK {
                     space_identifier: path_id,
                     ack_delay,
                     ranges: pns.recv_pkt_need_ack.clone(),
@@ -3855,10 +3855,10 @@ impl Connection {
                 };
 
                 // When a PING frame needs to be sent, avoid sending the
-                // ACK_MP if there is not enough cwnd
+                // MP_ACK if there is not enough cwnd
                 // available for both (note that PING
                 // frames are always 1 byte, so we just need to check that the
-                // ACK_MP's length is lower than cwnd).
+                // MP_ACK's length is lower than cwnd).
                 if (pns.ack_elicited ||
                     (left_before_packing_ack_frame - left) + frame.wire_len() <
                         cwnd_available) &&
@@ -3894,7 +3894,7 @@ impl Connection {
                                     as u32,
                             );
 
-                        let frame = frame::Frame::ACKMP {
+                        let frame = frame::Frame::MPACK {
                             space_identifier: space_id,
                             ack_delay,
                             ranges: pns.recv_pkt_need_ack.clone(),
@@ -3910,7 +3910,7 @@ impl Connection {
                             push_frame_to_pkt!(b, frames, frame, left)
                         {
                             // Continue advertising until we send the
-                            // ACK_MP
+                            // MP_ACK
                             // on
                             // its own path, unless the path is not
                             // active.
@@ -7893,7 +7893,7 @@ impl Connection {
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
 
-            frame::Frame::ACKMP {
+            frame::Frame::MPACK {
                 space_identifier,
                 ranges,
                 ack_delay,
@@ -7918,7 +7918,7 @@ impl Connection {
 
                 let handshake_status = self.handshake_status();
 
-                // If an endpoint receives an ACK_MP frame with a packet number
+                // If an endpoint receives an MP_ACK frame with a packet number
                 // space ID which was never issued by endpoints (i.e., with a
                 // sequence number larger than the largest one advertised), it
                 // MUST treat this as a connection error of type
@@ -7927,10 +7927,10 @@ impl Connection {
                     return Err(Error::MultiPathViolation);
                 }
 
-                // If an endpoint receives an ACK_MP frame with a packet number
+                // If an endpoint receives an MP_ACK frame with a packet number
                 // space ID which is no more active (e.g., retired by a
                 // RETIRE_CONNECTION_ID frame or belonging to closed paths), it
-                // MUST ignore the ACK_MP frame without causing a connection
+                // MUST ignore the MP_ACK frame without causing a connection
                 // error.
                 if let Some(path_id) =
                     self.paths.pid_from_path_id(space_identifier)
@@ -8399,7 +8399,7 @@ impl Connection {
             }
         }
 
-        // When using multiple packet number spaces, let's force ACK_MP sending
+        // When using multiple packet number spaces, let's force MP_ACK sending
         // on their corresponding paths.
         if self.is_multipath_enabled() {
             if let Some(pid) = self
@@ -18019,7 +18019,7 @@ mod tests {
         assert_eq!(path_s2c_0.active(), true);
         assert_eq!(path_s2c_1.active(), true);
 
-        // Flush the ACK_MP on the newly active path.
+        // Flush the MP_ACK on the newly active path.
         assert_eq!(pipe.advance(), Ok(()));
 
         // Emit enough data to use both paths, but no more than their initial

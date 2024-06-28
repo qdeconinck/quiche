@@ -178,7 +178,7 @@ pub enum Frame {
         length: usize,
     },
 
-    ACKMP {
+    MPACK {
         space_identifier: u64,
         ack_delay: u64,
         ranges: ranges::RangeSet,
@@ -431,7 +431,7 @@ impl Frame {
             (packet::Type::ZeroRTT, Frame::PathResponse { .. }) => false,
             (packet::Type::ZeroRTT, Frame::RetireConnectionId { .. }) => false,
             (packet::Type::ZeroRTT, Frame::ConnectionClose { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::ACKMP { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::MPACK { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathAbandon { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathStandby { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathAvailable { .. }) => false,
@@ -659,7 +659,7 @@ impl Frame {
 
             Frame::DatagramHeader { .. } => (),
 
-            Frame::ACKMP {
+            Frame::MPACK {
                 space_identifier,
                 ack_delay,
                 ranges,
@@ -918,7 +918,7 @@ impl Frame {
                 *length // data
             },
 
-            Frame::ACKMP {
+            Frame::MPACK {
                 space_identifier,
                 ack_delay,
                 ranges,
@@ -989,7 +989,7 @@ impl Frame {
                 Frame::ACK { .. } |
                 Frame::ApplicationClose { .. } |
                 Frame::ConnectionClose { .. } |
-                Frame::ACKMP { .. }
+                Frame::MPACK { .. }
         )
     }
 
@@ -1192,7 +1192,7 @@ impl Frame {
                 raw: None,
             },
 
-            Frame::ACKMP {
+            Frame::MPACK {
                 space_identifier,
                 ack_delay,
                 ranges,
@@ -1437,7 +1437,7 @@ impl std::fmt::Debug for Frame {
                 write!(f, "DATAGRAM len={length}")?;
             },
 
-            Frame::ACKMP {
+            Frame::MPACK {
                 space_identifier,
                 ack_delay,
                 ranges,
@@ -1446,7 +1446,7 @@ impl std::fmt::Debug for Frame {
             } => {
                 write!(
                     f,
-                    "ACK_MP space_id={space_identifier} delay={ack_delay} blocks={ranges:?} ecn_counts={ecn_counts:?}",
+                    "MP_ACK space_id={space_identifier} delay={ack_delay} blocks={ranges:?} ecn_counts={ecn_counts:?}",
                 )?;
             },
 
@@ -1574,7 +1574,7 @@ fn parse_ack_mp_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     let (ack_delay, ranges, ecn_counts) =
         parse_common_ack_frame(b, ty & 0x01 != 0)?;
 
-    Ok(Frame::ACKMP {
+    Ok(Frame::MPACK {
         space_identifier,
         ack_delay,
         ranges,
@@ -2552,7 +2552,7 @@ mod tests {
         ranges.insert(15..19);
         ranges.insert(3000..5000);
 
-        let frame = Frame::ACKMP {
+        let frame = Frame::MPACK {
             space_identifier: 894_994,
             ack_delay: 874_656_534,
             ranges,
@@ -2595,7 +2595,7 @@ mod tests {
             ecn_ce_count: 300,
         });
 
-        let frame = Frame::ACKMP {
+        let frame = Frame::MPACK {
             space_identifier: 894_994,
             ack_delay: 874_656_534,
             ranges,
