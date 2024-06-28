@@ -8167,7 +8167,7 @@ impl Connection {
             .iter()
             .filter(|(_, p)| p.active())
             .map(|(_, p)| p.recovery.cwnd_available())
-            .filter(|cwnd| *cwnd != std::usize::MAX)
+            .filter(|cwnd| *cwnd != usize::MAX)
             .sum();
         self.tx_cap = cmp::min(
             cwin_available,

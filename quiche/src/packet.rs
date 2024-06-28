@@ -915,6 +915,7 @@ pub struct PktNumSpaceCrypto {
     pub crypto_seal: Option<crypto::Seal>,
 
     pub crypto_0rtt_open: Option<crypto::Open>,
+    #[allow(dead_code)]
     pub crypto_0rtt_seal: Option<crypto::Seal>,
 
     pub crypto_stream: stream::Stream,
