@@ -1253,12 +1253,12 @@ impl Config {
         self.local_transport_params.disable_active_migration = v;
     }
 
-    /// Sets the `initial_max_paths` transport parameter, negotiating the usage
-    /// of the multipath extension over this connection with the given maximum
-    /// number of concurrent paths.
-    pub fn set_initial_max_paths(&mut self, v: u64) {
+    /// Sets the `initial_max_path_id` transport parameter, negotiating the
+    /// usage of the multipath extension over this connection with the given
+    /// maximum number of concurrent paths.
+    pub fn set_initial_max_path_id(&mut self, v: u64) {
         if v < 2_u64.pow(32) {
-            self.local_transport_params.initial_max_paths = Some(v);
+            self.local_transport_params.initial_max_path_id = Some(v);
         }
     }
 
@@ -2043,7 +2043,7 @@ impl Connection {
 
         // Don't support multipath with zero-length CIDs.
         if conn.ids.zero_length_scid() || conn.ids.zero_length_dcid() {
-            conn.local_transport_params.initial_max_paths = None;
+            conn.local_transport_params.initial_max_path_id = None;
         }
 
         if let Some(odcid) = odcid {
@@ -3186,7 +3186,7 @@ impl Connection {
                     },
 
                     frame::Frame::MPACK {
-                        space_identifier,
+                        path_identifier,
                         ranges,
                         ..
                     } => {
@@ -3198,7 +3198,7 @@ impl Connection {
                                 .spaces
                                 .get_mut(
                                     packet::Epoch::Application,
-                                    space_identifier,
+                                    path_identifier,
                                 )
                                 .map(|pns| {
                                     pns.recv_pkt_need_ack
@@ -3790,11 +3790,11 @@ impl Connection {
                     },
 
                     frame::Frame::MPACK {
-                        space_identifier, ..
+                        path_identifier, ..
                     } => {
                         self.pkt_num_spaces
                             .spaces
-                            .get_mut(epoch, space_identifier)
+                            .get_mut(epoch, path_identifier)
                             .map(|pns| {
                                 pns.ack_elicited = true;
                             })
@@ -4036,7 +4036,7 @@ impl Connection {
                     );
 
                 let frame = frame::Frame::MPACK {
-                    space_identifier: path_id,
+                    path_identifier: path_id,
                     ack_delay,
                     ranges: pns.recv_pkt_need_ack.clone(),
                     ecn_counts: None, /* sending ECN is not supported at
@@ -4084,7 +4084,7 @@ impl Connection {
                             );
 
                         let frame = frame::Frame::MPACK {
-                            space_identifier: space_id,
+                            path_identifier: space_id,
                             ack_delay,
                             ranges: pns.recv_pkt_need_ack.clone(),
                             ecn_counts: None, /* sending ECN is not
@@ -4490,11 +4490,11 @@ impl Connection {
 
             // Create MAX_PATHS frames as needed.
             if self.ids.should_send_max_paths() {
-                let frame = frame::Frame::MaxPaths {
+                let frame = frame::Frame::MaxPathId {
                     max_path_id: self.ids.local_max_paths_id(),
                 };
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    self.ids.on_max_paths_sent();
+                    self.ids.on_max_path_id_sent();
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -7448,8 +7448,8 @@ impl Connection {
             .set_source_conn_id_limit(peer_params.active_conn_id_limit);
 
         if let (Some(local), Some(peer)) = (
-            self.local_transport_params.initial_max_paths,
-            peer_params.initial_max_paths,
+            self.local_transport_params.initial_max_path_id,
+            peer_params.initial_max_path_id,
         ) {
             self.paths.set_multipath(true);
             self.ids.set_local_max_path_id(local, false);
@@ -8194,7 +8194,7 @@ impl Connection {
             frame::Frame::DatagramHeader { .. } => unreachable!(),
 
             frame::Frame::MPACK {
-                space_identifier,
+                path_identifier,
                 ranges,
                 ack_delay,
                 ..
@@ -8223,7 +8223,7 @@ impl Connection {
                 // sequence number larger than the largest one advertised), it
                 // MUST treat this as a connection error of type
                 // MP_PROTOCOL_VIOLATION and close the connection.
-                if space_identifier > self.ids.largest_path_id() {
+                if path_identifier > self.ids.largest_path_id() {
                     return Err(Error::MultiPathViolation);
                 }
 
@@ -8233,7 +8233,7 @@ impl Connection {
                 // MUST ignore the MP_ACK frame without causing a connection
                 // error.
                 if let Some(path_id) =
-                    self.paths.pid_from_path_id(space_identifier)
+                    self.paths.pid_from_path_id(path_identifier)
                 {
                     let is_app_limited =
                         self.delivery_rate_check_if_app_limited(path_id);
@@ -8372,7 +8372,7 @@ impl Connection {
                 }
             },
 
-            frame::Frame::MaxPaths { max_path_id } => {
+            frame::Frame::MaxPathId { max_path_id } => {
                 self.ids.set_remote_max_path_id(max_path_id);
             },
         };
@@ -9167,7 +9167,7 @@ pub struct TransportParams {
     pub max_datagram_frame_size: Option<u64>,
     /// Maximum number of active concurrent paths an endpoint is willing to
     /// build.
-    pub initial_max_paths: Option<u64>,
+    pub initial_max_path_id: Option<u64>,
 }
 
 impl Default for TransportParams {
@@ -9190,7 +9190,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
-            initial_max_paths: None,
+            initial_max_path_id: None,
         }
     }
 }
@@ -9341,8 +9341,8 @@ impl TransportParams {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
 
-                0x0f739bbc1b666d07 => {
-                    tp.initial_max_paths = Some(val.get_varint()?);
+                0x0f739bbc1b666d09 => {
+                    tp.initial_max_path_id = Some(val.get_varint()?);
                 },
 
                 // Ignore unknown parameters.
@@ -9507,13 +9507,13 @@ impl TransportParams {
             b.put_varint(max_datagram_frame_size)?;
         }
 
-        if let Some(initial_max_paths) = tp.initial_max_paths {
+        if let Some(initial_max_path_id) = tp.initial_max_path_id {
             TransportParams::encode_param(
                 &mut b,
-                0x0f739bbc1b666d07,
-                octets::varint_len(initial_max_paths),
+                0x0f739bbc1b666d09,
+                octets::varint_len(initial_max_path_id),
             )?;
-            b.put_varint(initial_max_paths)?;
+            b.put_varint(initial_max_path_id)?;
         }
 
         let out_len = b.off();
@@ -10154,7 +10154,7 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: Some(b"retry".to_vec().into()),
             max_datagram_frame_size: Some(32),
-            initial_max_paths: Some(4),
+            initial_max_path_id: Some(4),
         };
 
         let mut raw_params = [42; 256];
@@ -10185,7 +10185,7 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: None,
             max_datagram_frame_size: Some(32),
-            initial_max_paths: Some(4),
+            initial_max_path_id: Some(4),
         };
 
         let mut raw_params = [42; 256];
@@ -18761,7 +18761,7 @@ mod tests {
         config.set_initial_max_streams_bidi(2);
         // To test with enabled datagrams.
         config.enable_dgram(true, 10, 10);
-        config.set_initial_max_paths(4);
+        config.set_initial_max_path_id(4);
 
         let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 0);
 
@@ -18992,7 +18992,7 @@ mod tests {
         config.set_initial_max_stream_data_bidi_local(100000);
         config.set_initial_max_stream_data_bidi_remote(100000);
         config.set_initial_max_streams_bidi(2);
-        config.set_initial_max_paths(4);
+        config.set_initial_max_path_id(4);
 
         let pipe = pipe_with_exchanged_cids(&mut config, 0, 16, 1);
 

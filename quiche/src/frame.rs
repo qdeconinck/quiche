@@ -186,7 +186,7 @@ pub enum Frame {
     },
 
     MPACK {
-        space_identifier: u64,
+        path_identifier: u64,
         ack_delay: u64,
         ranges: ranges::RangeSet,
         ecn_counts: Option<EcnCounts>,
@@ -221,7 +221,7 @@ pub enum Frame {
         seq_num: u64,
     },
 
-    MaxPaths {
+    MaxPathId {
         max_path_id: u64,
     },
 }
@@ -371,7 +371,7 @@ impl Frame {
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
-            0x15228c00..=0x15228c01 => parse_ack_mp_frame(frame_type, b)?,
+            0x15228c00..=0x15228c01 => parse_mp_ack_frame(frame_type, b)?,
 
             0x15228c05 => Frame::PathAbandon {
                 path_id: b.get_varint()?,
@@ -417,7 +417,7 @@ impl Frame {
                 seq_num: b.get_varint()?,
             },
 
-            0x15228c0b => Frame::MaxPaths {
+            0x15228c0c => Frame::MaxPathId {
                 max_path_id: b.get_varint()?,
             },
 
@@ -444,7 +444,7 @@ impl Frame {
             (packet::Type::ZeroRTT, Frame::PathAvailable { .. }) => false,
             (packet::Type::ZeroRTT, Frame::MpNewConnectionId { .. }) => false,
             (packet::Type::ZeroRTT, Frame::MpRetireConnectionId { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::MaxPaths { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::MaxPathId { .. }) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -667,7 +667,7 @@ impl Frame {
             Frame::DatagramHeader { .. } => (),
 
             Frame::MPACK {
-                space_identifier,
+                path_identifier,
                 ack_delay,
                 ranges,
                 ecn_counts,
@@ -677,7 +677,7 @@ impl Frame {
                 } else {
                     b.put_varint(0x15228c01)?;
                 }
-                b.put_varint(*space_identifier)?;
+                b.put_varint(*path_identifier)?;
                 common_ack_to_bytes(b, ack_delay, ranges, ecn_counts)?;
             },
 
@@ -732,8 +732,8 @@ impl Frame {
                 b.put_varint(*seq_num)?;
             },
 
-            Frame::MaxPaths { max_path_id } => {
-                b.put_varint(0x15228c0b)?;
+            Frame::MaxPathId { max_path_id } => {
+                b.put_varint(0x15228c0c)?;
 
                 b.put_varint(*max_path_id)?;
             },
@@ -926,13 +926,13 @@ impl Frame {
             },
 
             Frame::MPACK {
-                space_identifier,
+                path_identifier,
                 ack_delay,
                 ranges,
                 ecn_counts,
             } => {
                 4 + // frame_type
-                octets::varint_len(*space_identifier) + // space_identifier
+                octets::varint_len(*path_identifier) + // path_identifier
                 common_ack_wire_len(ack_delay, ranges, ecn_counts)
             },
 
@@ -981,7 +981,7 @@ impl Frame {
                 octets::varint_len(*path_id) + // path_id
                 octets::varint_len(*seq_num) // seq_num
             },
-            Frame::MaxPaths { max_path_id } => {
+            Frame::MaxPathId { max_path_id } => {
                 4 + // frame type
                 octets::varint_len(*max_path_id) // path_id
             },
@@ -1212,7 +1212,7 @@ impl Frame {
             },
 
             Frame::MPACK {
-                space_identifier,
+                path_identifier,
                 ack_delay,
                 ranges,
                 ecn_counts,
@@ -1231,8 +1231,8 @@ impl Frame {
                     None => (None, None, None),
                 };
 
-                QuicFrame::AckMp {
-                    space_identifier: *space_identifier,
+                QuicFrame::MpAck {
+                    path_identifier: *path_identifier,
                     ack_delay: Some(*ack_delay as f32 / 1000.0),
                     acked_ranges: Some(ack_ranges),
                     ect1,
@@ -1285,7 +1285,7 @@ impl Frame {
                     sequence_number: *seq_num,
                 },
 
-            Frame::MaxPaths { max_path_id } => QuicFrame::MaxPaths {
+            Frame::MaxPathId { max_path_id } => QuicFrame::MaxPathId {
                 max_path_id: *max_path_id,
             },
         }
@@ -1457,7 +1457,7 @@ impl std::fmt::Debug for Frame {
             },
 
             Frame::MPACK {
-                space_identifier,
+                path_identifier,
                 ack_delay,
                 ranges,
                 ecn_counts,
@@ -1465,7 +1465,7 @@ impl std::fmt::Debug for Frame {
             } => {
                 write!(
                     f,
-                    "MP_ACK space_id={space_identifier} delay={ack_delay} blocks={ranges:?} ecn_counts={ecn_counts:?}",
+                    "MP_ACK path_id={path_identifier} delay={ack_delay} blocks={ranges:?} ecn_counts={ecn_counts:?}",
                 )?;
             },
 
@@ -1515,8 +1515,8 @@ impl std::fmt::Debug for Frame {
                 )?;
             },
 
-            Frame::MaxPaths { max_path_id } => {
-                write!(f, "MAX_PATHS max_path_id={max_path_id}")?;
+            Frame::MaxPathId { max_path_id } => {
+                write!(f, "MAX_PATH_ID max_path_id={max_path_id}")?;
             },
         }
 
@@ -1588,13 +1588,13 @@ fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     })
 }
 
-fn parse_ack_mp_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
-    let space_identifier = b.get_varint()?;
+fn parse_mp_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
+    let path_identifier = b.get_varint()?;
     let (ack_delay, ranges, ecn_counts) =
         parse_common_ack_frame(b, ty & 0x01 != 0)?;
 
     Ok(Frame::MPACK {
-        space_identifier,
+        path_identifier,
         ack_delay,
         ranges,
         ecn_counts,
@@ -2572,7 +2572,7 @@ mod tests {
         ranges.insert(3000..5000);
 
         let frame = Frame::MPACK {
-            space_identifier: 894_994,
+            path_identifier: 894_994,
             ack_delay: 874_656_534,
             ranges,
             ecn_counts: None,
@@ -2615,7 +2615,7 @@ mod tests {
         });
 
         let frame = Frame::MPACK {
-            space_identifier: 894_994,
+            path_identifier: 894_994,
             ack_delay: 874_656_534,
             ranges,
             ecn_counts,
@@ -2763,10 +2763,10 @@ mod tests {
     }
 
     #[test]
-    fn max_paths_frame() {
+    fn max_path_id_frame() {
         let mut d = [42; 128];
 
-        let frame = Frame::MaxPaths { max_path_id: 42 };
+        let frame = Frame::MaxPathId { max_path_id: 42 };
 
         let wire_len = {
             let mut b = octets::OctetsMut::with_slice(&mut d);
