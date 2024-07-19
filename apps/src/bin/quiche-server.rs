@@ -123,8 +123,8 @@ fn main() {
     config.set_initial_congestion_window_packets(
         usize::try_from(conn_args.initial_cwnd_packets).unwrap(),
     );
-    if let Some(initial_max_paths) = conn_args.initial_max_paths {
-        config.set_initial_max_paths(initial_max_paths);
+    if let Some(initial_max_path_id) = conn_args.initial_max_path_id {
+        config.set_initial_max_path_id(initial_max_path_id);
     }
 
     config.set_max_connection_window(conn_args.max_window);

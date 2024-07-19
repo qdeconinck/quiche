@@ -127,8 +127,8 @@ pub fn connect(
     config.set_initial_max_streams_uni(conn_args.max_streams_uni);
     config.set_disable_active_migration(!conn_args.enable_active_migration);
     config.set_active_connection_id_limit(conn_args.max_active_cids);
-    if let Some(initial_max_paths) = conn_args.initial_max_paths {
-        config.set_initial_max_paths(initial_max_paths);
+    if let Some(initial_max_path_id) = conn_args.initial_max_path_id {
+        config.set_initial_max_path_id(initial_max_path_id);
     }
 
     config.set_max_connection_window(conn_args.max_window);
@@ -495,7 +495,7 @@ pub fn connect(
             }
         }
 
-        if conn_args.initial_max_paths.is_some() &&
+        if conn_args.initial_max_path_id.is_some() &&
             probed_paths < addrs.len() &&
             conn.available_dcids() > 0 &&
             conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
@@ -503,7 +503,7 @@ pub fn connect(
             probed_paths += 1;
         }
 
-        if conn_args.initial_max_paths.is_none() &&
+        if conn_args.initial_max_path_id.is_none() &&
             args.perform_migration &&
             !new_path_probed &&
             scid_sent &&
