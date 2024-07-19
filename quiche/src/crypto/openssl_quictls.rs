@@ -32,7 +32,7 @@ impl Algorithm {
 
 impl Open {
     pub fn open_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8],
+        &self, path_seq: u32, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
         if cfg!(feature = "fuzzing") {
             return Ok(buf.len());
@@ -43,7 +43,7 @@ impl Open {
 
         let mut cipher_len = buf.len();
 
-        let nonce = make_nonce(&self.packet.nonce, counter);
+        let nonce = make_nonce(&self.packet.nonce, path_seq, counter);
 
         // Set the IV len.
         const EVP_CTRL_AEAD_SET_IVLEN: i32 = 0x9;
@@ -146,8 +146,8 @@ impl Open {
 
 impl Seal {
     pub fn seal_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
-        extra_in: Option<&[u8]>,
+        &self, path_seq: u32, counter: u64, ad: &[u8], buf: &mut [u8],
+        in_len: usize, extra_in: Option<&[u8]>,
     ) -> Result<usize> {
         if cfg!(feature = "fuzzing") {
             if let Some(extra) = extra_in {
@@ -160,7 +160,7 @@ impl Seal {
         // very inefficient
         let in_buf = buf.to_owned();
 
-        let nonce = make_nonce(&self.packet.nonce, counter);
+        let nonce = make_nonce(&self.packet.nonce, path_seq, counter);
 
         // Set the IV len.
         const EVP_CTRL_AEAD_SET_IVLEN: i32 = 0x9;
