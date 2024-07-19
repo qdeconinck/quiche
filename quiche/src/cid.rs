@@ -1461,7 +1461,7 @@ impl ConnectionIdentifiers {
 
     /// When a MAX_PATHS frame has been sent.
     #[inline]
-    pub fn on_max_paths_sent(&mut self) {
+    pub fn on_max_path_id_sent(&mut self) {
         self.advertise_local_max_path_id = false;
     }
 
