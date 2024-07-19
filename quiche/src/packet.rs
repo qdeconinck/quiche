@@ -34,6 +34,7 @@ use std::time;
 use ring::aead;
 
 use crate::Error;
+use crate::PathId;
 use crate::Result;
 
 use crate::crypto;
@@ -957,12 +958,7 @@ impl PktNumSpaceCrypto {
 
 pub struct PktNumSpaceImplMap {
     pkt_num_spaces: [PktNumSpace; Epoch::Application as usize],
-    application_pkt_num_spaces: BTreeMap<u64, PktNumSpace>,
-
-    /// Lowest possible RX space ID still in use.
-    lowest_rx_space_id: u64,
-    /// Lowest possible TX space ID still in use.
-    lowest_tx_space_id: u64,
+    application_pkt_num_spaces: BTreeMap<PathId, PktNumSpace>,
 }
 
 impl PktNumSpaceImplMap {
@@ -970,13 +966,10 @@ impl PktNumSpaceImplMap {
         PktNumSpaceImplMap {
             pkt_num_spaces: [PktNumSpace::new(), PktNumSpace::new()],
             application_pkt_num_spaces: BTreeMap::from([(0, PktNumSpace::new())]),
-
-            lowest_rx_space_id: 0,
-            lowest_tx_space_id: 0,
         }
     }
 
-    pub fn get(&self, epoch: Epoch, space_id: u64) -> Result<&PktNumSpace> {
+    pub fn get(&self, epoch: Epoch, space_id: PathId) -> Result<&PktNumSpace> {
         match epoch {
             Epoch::Application => self
                 .application_pkt_num_spaces
@@ -987,7 +980,7 @@ impl PktNumSpaceImplMap {
     }
 
     pub fn get_mut_or_create(
-        &mut self, epoch: Epoch, space_id: u64,
+        &mut self, epoch: Epoch, space_id: PathId,
     ) -> &mut PktNumSpace {
         match epoch {
             Epoch::Application => self
@@ -999,7 +992,7 @@ impl PktNumSpaceImplMap {
     }
 
     pub fn get_mut(
-        &mut self, epoch: Epoch, space_id: u64,
+        &mut self, epoch: Epoch, space_id: PathId,
     ) -> Result<&mut PktNumSpace> {
         match epoch {
             Epoch::Application => self
@@ -1010,7 +1003,7 @@ impl PktNumSpaceImplMap {
         }
     }
 
-    fn is_ready(&self, epoch: Epoch, space_id: Option<u64>) -> bool {
+    fn is_ready(&self, epoch: Epoch, space_id: Option<PathId>) -> bool {
         match (epoch, space_id) {
             (Epoch::Application, None) => self
                 .application_pkt_num_spaces
@@ -1027,27 +1020,22 @@ impl PktNumSpaceImplMap {
         }
     }
 
-    /// Remove application packet number spaces whose connection IDs have been
-    /// retired, to free their memory.
-    fn remove_dangling_application_pkt_num_spaces(&mut self) {
-        let lowest_space_id =
-            std::cmp::min(self.lowest_rx_space_id, self.lowest_tx_space_id);
-        self.application_pkt_num_spaces
-            .retain(|&s, _| s >= lowest_space_id)
+    pub fn remove_application_data_space_id(&mut self, id: PathId) -> Result<()> {
+        if !self.application_pkt_num_spaces.contains_key(&id) {
+            warn!("Trying to remove non-present pkt num space with id {}; continuing", id);
+            return Ok(());
+        }
+        if self.application_pkt_num_spaces.len() <= 1 {
+            return Err(Error::OutOfPathId);
+        }
+        self.application_pkt_num_spaces.remove(&id);
+        Ok(())
     }
 
-    pub fn update_lowest_active_rx_id(&mut self, rx_id: u64) {
-        if rx_id > self.lowest_rx_space_id {
-            self.lowest_rx_space_id = rx_id;
-            self.remove_dangling_application_pkt_num_spaces();
-        }
-    }
-
-    pub fn update_lowest_active_tx_id(&mut self, tx_id: u64) {
-        if tx_id > self.lowest_tx_space_id {
-            self.lowest_tx_space_id = tx_id;
-            self.remove_dangling_application_pkt_num_spaces();
-        }
+    pub fn application_data_space_ids(
+        &self,
+    ) -> impl Iterator<Item = PathId> + '_ {
+        self.application_pkt_num_spaces.keys().copied()
     }
 }
 

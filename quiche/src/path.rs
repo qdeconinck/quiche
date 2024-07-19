@@ -34,7 +34,9 @@ use smallvec::SmallVec;
 
 use slab::Slab;
 
+use crate::CIDSeq;
 use crate::Error;
+use crate::PathId;
 use crate::Result;
 
 use crate::pmtud;
@@ -73,6 +75,66 @@ impl PathValidationState {
     }
 }
 
+/// The different usage states of the path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathState {
+    /// The path only sends probing packets.
+    Unused,
+    /// The path can send non-probing packets.
+    Active,
+    /// The path is under closing process.
+    Closing(u64, Vec<u8>),
+    /// The path is now closed.
+    Closed(u64, Vec<u8>),
+}
+
+/// The different requests that can be assigned to a path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathRequest {
+    /// The path should not send non-probing packets.
+    Unused,
+    /// The path should send probing packets.
+    Active,
+    /// The path should be abandonned, with the provided error code and reason
+    /// message.
+    Abandon(u64, Vec<u8>),
+}
+
+impl PathRequest {
+    fn requested_state(self) -> PathState {
+        match self {
+            PathRequest::Unused => PathState::Unused,
+            PathRequest::Active => PathState::Active,
+            PathRequest::Abandon(e, r) => PathState::Closing(e, r),
+        }
+    }
+}
+
+/// The status of a path, advertised through the PATH_STATUS frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathStatus {
+    /// The host should stop sending non-probing packets on the path.
+    Standby,
+
+    /// The host should consider this path to send non-probing packets.
+    Available,
+}
+
+impl From<PathStatus> for bool {
+    fn from(s: PathStatus) -> Self {
+        matches!(s, PathStatus::Available)
+    }
+}
+
+impl From<bool> for PathStatus {
+    fn from(v: bool) -> Self {
+        match v {
+            false => PathStatus::Standby,
+            true => PathStatus::Available,
+        }
+    }
+}
+
 /// A path-specific event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathEvent {
@@ -100,7 +162,7 @@ pub enum PathEvent {
     /// number, initially used by the peer over the first pair of `SocketAddr`s,
     /// is now reused over the second pair of `SocketAddr`s.
     ReusedSourceConnectionId(
-        u64,
+        CIDSeq,
         (SocketAddr, SocketAddr),
         (SocketAddr, SocketAddr),
     ),
@@ -111,10 +173,16 @@ pub enum PathEvent {
     ///
     /// Note that this event is only raised if the path has been validated.
     PeerMigrated(SocketAddr, SocketAddr),
+
+    /// The peer advertised the path status for the mentioned 4-tuple.
+    PeerPathStatus((SocketAddr, SocketAddr), PathStatus),
 }
 
 /// A network path on which QUIC packets can be sent.
 pub struct Path {
+    /// The explicit path ID in multipath.
+    path_id: PathId,
+
     /// The local address.
     local_addr: SocketAddr,
 
@@ -129,9 +197,8 @@ pub struct Path {
 
     /// The current validation state of the path.
     validation_state: PathValidationState,
-
-    /// Is this path used to send non-probing packets.
-    active: bool,
+    /// The usage state of this path.
+    state: PathState,
 
     /// Loss recovery and congestion control state.
     pub recovery: recovery::Recovery,
@@ -177,6 +244,14 @@ pub struct Path {
     /// This counts only STREAM and CRYPTO data.
     pub stream_retrans_bytes: u64,
 
+    /// The timeout of closing the path.
+    closing_timer: Option<std::time::Instant>,
+    /// Whether the peer abandoned this path.
+    peer_abandoned: bool,
+
+    /// The scheduling status of this path.
+    status: PathStatus,
+
     /// Total number of bytes the server can send before the peer's address
     /// is verified.
     pub max_send_bytes: usize,
@@ -199,13 +274,16 @@ pub struct Path {
 
     /// Whether or not we should force eliciting of an ACK (e.g. via PING frame)
     pub needs_ack_eliciting: bool,
+
+    /// The expected sequence number of the PATH_STATUS to be received.
+    expected_path_status_seq_num: u64,
 }
 
 impl Path {
     /// Create a new Path instance with the provided addresses, the remaining of
     /// the fields being set to their default value.
     pub fn new(
-        local_addr: SocketAddr, peer_addr: SocketAddr,
+        path_id: PathId, local_addr: SocketAddr, peer_addr: SocketAddr,
         recovery_config: &recovery::RecoveryConfig,
         path_challenge_recv_max_queue_len: usize, pmtud_init: usize,
         is_initial: bool,
@@ -217,12 +295,13 @@ impl Path {
         };
 
         Self {
+            path_id,
             local_addr,
             peer_addr,
             active_scid_seq,
             active_dcid_seq,
             validation_state,
-            active: false,
+            state: PathState::Unused,
             recovery: recovery::Recovery::new_with_config(recovery_config),
             pmtud: pmtud::Pmtud::new(pmtud_init),
             in_flight_challenges: VecDeque::new(),
@@ -239,6 +318,9 @@ impl Path {
             sent_bytes: 0,
             recv_bytes: 0,
             stream_retrans_bytes: 0,
+            closing_timer: None,
+            peer_abandoned: false,
+            status: PathStatus::Available,
             max_send_bytes: 0,
             verified_peer_address: false,
             peer_verified_local_address: false,
@@ -246,6 +328,7 @@ impl Path {
             failure_notified: false,
             migrating: false,
             needs_ack_eliciting: false,
+            expected_path_status_seq_num: 0,
         }
     }
 
@@ -270,7 +353,9 @@ impl Path {
     /// Returns whether the path is active.
     #[inline]
     pub fn active(&self) -> bool {
-        self.active && self.working() && self.active_dcid_seq.is_some()
+        self.state == PathState::Active &&
+            self.working() &&
+            self.active_dcid_seq.is_some()
     }
 
     /// Returns whether the path can be used to send non-probing packets.
@@ -279,6 +364,12 @@ impl Path {
         self.active() ||
             (self.validation_state == PathValidationState::Validated &&
                 self.active_dcid_seq.is_some())
+    }
+
+    /// Returns the path ID of the network path.
+    #[inline]
+    pub fn path_id(&self) -> PathId {
+        self.path_id
     }
 
     /// Returns whether the path is unused.
@@ -292,6 +383,18 @@ impl Path {
     #[inline]
     pub fn probing_required(&self) -> bool {
         !self.received_challenges.is_empty() || self.validation_requested()
+    }
+
+    /// Returns whether this path is under closing process.
+    #[inline]
+    pub fn is_closing(&self) -> bool {
+        matches!(self.state, PathState::Closing(_, _))
+    }
+
+    /// Returns whether this path is closed.
+    #[inline]
+    fn closed(&self) -> bool {
+        matches!(self.state, PathState::Closed(_, _))
     }
 
     /// Promotes the path to the provided validation state only if the new state
@@ -376,6 +479,10 @@ impl Path {
         self.in_flight_challenges.iter().any(|(d, ..)| *d == data)
     }
 
+    pub fn on_abandon_received(&mut self) {
+        self.peer_abandoned = true;
+    }
+
     /// Returns whether the path is now validated.
     pub fn on_response_received(&mut self, data: [u8; 8]) -> bool {
         self.verified_peer_address = true;
@@ -413,7 +520,46 @@ impl Path {
 
     fn on_failed_validation(&mut self) {
         self.validation_state = PathValidationState::Failed;
-        self.active = false;
+        self.state = PathState::Unused;
+    }
+
+    pub fn on_closing_timeout(&mut self) {
+        self.closing_timer = None;
+    }
+
+    pub fn closing_error_code_and_reason(&self) -> Result<(u64, Vec<u8>)> {
+        match &self.state {
+            PathState::Closing(e, r) | PathState::Closed(e, r) =>
+                Ok((*e, r.clone())),
+            _ => Err(Error::InvalidState),
+        }
+    }
+
+    #[inline]
+    fn valid_state_transition(&self, new_state: &PathState) -> bool {
+        match (&self.state, new_state) {
+            // In Unused or Active, we can transition to any state.
+            (PathState::Unused, _) => true,
+            (PathState::Active, _) => true,
+            // In Closing, we can only transition to Closing or Closed.
+            (PathState::Closing(..), PathState::Closing(..)) => true,
+            (PathState::Closing(..), PathState::Closed(..)) => true,
+            // In Close, we can only transition to itself.
+            (PathState::Closed(..), PathState::Closed(..)) => true,
+            // Any other transition is invalid.
+            (..) => false,
+        }
+    }
+
+    /// Sets the state of a path, returning an error if the transition is not
+    /// valid.
+    fn set_state(&mut self, state: PathState) -> Result<()> {
+        if !self.valid_state_transition(&state) {
+            return Err(Error::InvalidState);
+        }
+
+        self.state = state;
+        Ok(())
     }
 
     #[inline]
@@ -421,9 +567,18 @@ impl Path {
         self.received_challenges.pop_front()
     }
 
+    /// Returns the time at which a timeout will occur on the path.
     #[inline]
     pub fn path_timer(&self) -> Option<time::Instant> {
-        self.recovery.loss_detection_timer()
+        [self.closing_timer, self.recovery.loss_detection_timer()]
+            .iter()
+            .filter_map(|&t| t)
+            .min()
+    }
+
+    #[inline]
+    pub fn closing_timer(&self) -> Option<time::Instant> {
+        self.closing_timer
     }
 
     pub fn on_loss_detection_timeout(
@@ -481,11 +636,18 @@ impl Path {
         (lost_packets, lost_bytes)
     }
 
+    #[inline]
+    pub fn is_standby(&self) -> bool {
+        matches!(self.status, PathStatus::Standby)
+    }
+
     pub fn stats(&self) -> PathStats {
         PathStats {
+            path_id: self.path_id,
             local_addr: self.local_addr,
             peer_addr: self.peer_addr,
             validation_state: self.validation_state,
+            state: self.state.clone(),
             active: self.active(),
             recv: self.recv_count,
             sent: self.sent_count,
@@ -546,10 +708,22 @@ pub struct PathMap {
     addrs_to_paths: BTreeMap<(SocketAddr, SocketAddr), usize>,
 
     /// Path-specific events to be notified to the application.
-    events: VecDeque<PathEvent>,
+    events: VecDeque<(PathId, PathEvent)>,
 
     /// Whether this manager serves a connection as a server.
     is_server: bool,
+
+    /// Whether the multipath extensions are enabled.
+    multipath: bool,
+
+    /// Path identifiers requiring sending PATH_ABANDON frames.
+    path_abandon: VecDeque<usize>,
+
+    /// Whether a connection-wide PATH_STATUS frame should be sent.
+    /// Send a PATH_AVAILABLE is true, PATH_STANDBY else.
+    path_status_to_advertise: VecDeque<(usize, u64, bool)>,
+    /// The sequence number for the next PATH_STATUS.
+    next_path_status_seq_num: u64,
 }
 
 impl PathMap {
@@ -566,7 +740,7 @@ impl PathMap {
         let peer_addr = initial_path.peer_addr;
 
         // As it is the first path, it is active by default.
-        initial_path.active = true;
+        initial_path.state = PathState::Active;
 
         // Enable path MTU Discovery and start probing with the largest datagram
         // size.
@@ -585,6 +759,10 @@ impl PathMap {
             addrs_to_paths,
             events: VecDeque::new(),
             is_server,
+            multipath: false,
+            path_abandon: VecDeque::new(),
+            path_status_to_advertise: VecDeque::new(),
+            next_path_status_seq_num: 0,
         }
     }
 
@@ -676,6 +854,18 @@ impl PathMap {
         self.addrs_to_paths.get(addrs).copied()
     }
 
+    /// Returns the internal active `Path` identifier related to the explicit
+    /// PathId.
+    #[inline]
+    pub fn pid_from_path_id(&self, path_id: PathId) -> Option<usize> {
+        self.paths
+            .iter()
+            .find(|(_, p)| {
+                p.path_id() == path_id && (self.multipath || p.active())
+            })
+            .map(|(pid, _)| pid)
+    }
+
     /// Checks if creating a new path will not exceed the current `self.paths`
     /// capacity. If yes, this method tries to remove one unused path. If it
     /// fails to do so, returns [`Done`].
@@ -696,14 +886,39 @@ impl PathMap {
         self.addrs_to_paths
             .remove(&(path.local_addr, path.peer_addr));
 
-        self.notify_event(PathEvent::Closed(
-            path.local_addr,
-            path.peer_addr,
-            0,
-            "unused path".into(),
-        ));
+        self.notify_event(
+            path.path_id,
+            PathEvent::Closed(
+                path.local_addr,
+                path.peer_addr,
+                0,
+                "unused path".into(),
+            ),
+        );
 
         Ok(())
+    }
+
+    /// Adds or remove the path ID from the set of paths requiring sending a
+    /// PATH_ABANDON frame.
+    fn mark_path_abandon(&mut self, path_id: usize, abandon: bool) {
+        if abandon {
+            self.path_abandon.push_back(path_id);
+        } else {
+            self.path_abandon.retain(|p| *p != path_id);
+        }
+    }
+
+    /// Returns the Path ID that should be advertised in the next PATH_ABANDON
+    /// frame.
+    pub fn path_abandon(&self) -> Option<usize> {
+        self.path_abandon.front().copied()
+    }
+
+    /// Returns true if there are any paths that need to send PATH_ABANDON
+    /// frames.
+    pub fn has_path_abandon(&self) -> bool {
+        !self.path_abandon.is_empty()
     }
 
     /// Records the provided `Path` and returns its assigned identifier.
@@ -719,6 +934,7 @@ impl PathMap {
     pub fn insert_path(&mut self, path: Path, is_server: bool) -> Result<usize> {
         self.make_room_for_new_path()?;
 
+        let path_id = path.path_id;
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
 
@@ -727,19 +943,19 @@ impl PathMap {
 
         // Notifies the application if we are in server mode.
         if is_server {
-            self.notify_event(PathEvent::New(local_addr, peer_addr));
+            self.notify_event(path_id, PathEvent::New(local_addr, peer_addr));
         }
 
         Ok(pid)
     }
 
     /// Notifies a path event to the application served by the connection.
-    pub fn notify_event(&mut self, ev: PathEvent) {
-        self.events.push_back(ev);
+    pub fn notify_event(&mut self, path_id: PathId, ev: PathEvent) {
+        self.events.push_back((path_id, ev));
     }
 
     /// Gets the first path event to be notified to the application.
-    pub fn pop_event(&mut self) -> Option<PathEvent> {
+    pub fn pop_event(&mut self) -> Option<(PathId, PathEvent)> {
         self.events.pop_front()
     }
 
@@ -751,12 +967,29 @@ impl PathMap {
             .filter(|(_, p)| p.validation_failed() && !p.failure_notified);
 
         for (_, p) in validation_failed {
-            self.events.push_back(PathEvent::FailedValidation(
-                p.local_addr,
-                p.peer_addr,
+            self.events.push_back((
+                p.path_id(),
+                PathEvent::FailedValidation(p.local_addr, p.peer_addr),
             ));
 
             p.failure_notified = true;
+        }
+    }
+
+    pub fn notify_closed_paths(&mut self) {
+        let paths = &mut self.paths;
+        let events = &mut self.events;
+        for (_, p) in paths
+            .iter_mut()
+            .filter(|(_, p)| p.closed() && !p.failure_notified)
+        {
+            if let PathState::Closed(e, r) = &p.state {
+                events.push_back((
+                    p.path_id(),
+                    PathEvent::Closed(p.local_addr, p.peer_addr, *e, r.clone()),
+                ));
+                p.failure_notified = true;
+            }
         }
     }
 
@@ -769,6 +1002,11 @@ impl PathMap {
             .map(|(pid, _)| pid)
     }
 
+    /// Returns whether standby paths should be considered to send data packets.
+    pub fn consider_standby_paths(&self) -> bool {
+        self.iter().filter(|(_, p)| !p.is_standby()).count() == 0
+    }
+
     /// Handles incoming PATH_RESPONSE data.
     pub fn on_response_received(&mut self, data: [u8; 8]) -> Result<()> {
         let active_pid = self.get_active_path_id()?;
@@ -778,6 +1016,7 @@ impl PathMap {
 
         if let Some((pid, p)) = challenge_pending {
             if p.on_response_received(data) {
+                let path_id = p.path_id;
                 let local_addr = p.local_addr;
                 let peer_addr = p.peer_addr;
                 let was_migrating = p.migrating;
@@ -785,49 +1024,172 @@ impl PathMap {
                 p.migrating = false;
 
                 // Notifies the application.
-                self.notify_event(PathEvent::Validated(local_addr, peer_addr));
+                self.notify_event(
+                    path_id,
+                    PathEvent::Validated(local_addr, peer_addr),
+                );
 
                 // If this path was the candidate for migration, notifies the
                 // application.
                 if pid == active_pid && was_migrating {
-                    self.notify_event(PathEvent::PeerMigrated(
-                        local_addr, peer_addr,
-                    ));
+                    self.notify_event(
+                        path_id,
+                        PathEvent::PeerMigrated(local_addr, peer_addr),
+                    );
                 }
             }
         }
         Ok(())
     }
 
+    /// Handles acknowledged PATH_ABANDONs.
+    pub fn on_path_abandon_acknowledged(
+        &mut self, abandon_path_id: PathId, now: time::Instant, trace_id: &str,
+    ) -> (usize, usize) {
+        let abandon_pid = match self.pid_from_path_id(abandon_path_id) {
+            Some(pid) => pid,
+            None => return (0, 0),
+        };
+        let path = match self.get_mut(abandon_pid) {
+            Ok(p) => p,
+            Err(_) => return (0, 0),
+        };
+
+        let path_id = path.path_id;
+        let local_addr = path.local_addr;
+        let peer_addr = path.peer_addr;
+        let to_notify = if let PathState::Closing(e, r) = &mut path.state {
+            let to_notify = Some((*e, r.clone()));
+            path.state = PathState::Closed(*e, std::mem::take(r));
+            to_notify
+        } else {
+            None
+        };
+        let lost_info = path.recovery.mark_all_inflight_as_lost(now, trace_id);
+        if let Some((e, r)) = to_notify {
+            self.notify_event(
+                path_id,
+                PathEvent::Closed(local_addr, peer_addr, e, r),
+            );
+        }
+        lost_info
+    }
+
+    /// Handles incoming PATH_ABANDONs.
+    pub fn on_path_abandon_received(
+        &mut self, abandon_path_id: PathId, error_code: u64, reason: Vec<u8>,
+    ) -> Result<()> {
+        let is_server = self.is_server;
+        let nb_paths = self.paths.len();
+        let abandon_pid = match self.pid_from_path_id(abandon_path_id) {
+            Some(pid) => pid,
+            None => {
+                warn!("Received path abandon for path_id {}, but it is unknown; ingore PathAbandon", abandon_path_id);
+                return Ok(());
+            },
+        };
+        let abandon_path = self.get_mut(abandon_pid)?;
+        // If we are the server, and receiving a PATH_ABANDON for the only
+        // active path, request a connection closure.
+        if is_server && nb_paths == 1 {
+            return Err(Error::UnavailablePath);
+        }
+        // If the path was already closed, just close it.
+        if abandon_path.closed() {
+            return Ok(());
+        }
+        let was_closing = abandon_path.is_closing();
+        abandon_path.set_state(PathState::Closing(error_code, reason))?;
+        abandon_path.on_abandon_received();
+        if !was_closing {
+            self.mark_path_abandon(abandon_pid, true);
+        }
+        Ok(())
+    }
+
+    /// Handles the sending of PATH_ABANDONs.
+    pub fn on_path_abandon_sent(
+        &mut self, abandon_path_id: usize, now: time::Instant,
+    ) -> Result<()> {
+        let abandoned_path = self.get_mut(abandon_path_id)?;
+        abandoned_path.closing_timer = Some(now + abandoned_path.recovery.pto());
+        self.mark_path_abandon(abandon_path_id, false);
+        Ok(())
+    }
+
+    /// Returns whether multipath extension has been enabled.
+    pub fn multipath(&self) -> bool {
+        self.multipath
+    }
+
+    /// Sets whether multipath extension is enabled.
+    pub fn set_multipath(&mut self, v: bool) {
+        self.multipath = v;
+    }
+
+    /// Changes the state of the path with the identifier `path_id` according to
+    /// the provided `PathRequest`.
+    ///
+    /// This API is only usable when multipath extensions are enabled.
+    /// Otherwise, it raises an [`InvalidState`].
+    ///
+    /// In case the request is invalid, returns an [`InvalidState`].
+    ///
+    /// [`InvalidState`]: enum.Error.html#variant.InvalidState
+    pub fn request(
+        &mut self, path_id: usize, request: PathRequest,
+    ) -> Result<()> {
+        if !self.multipath {
+            return Err(Error::InvalidState);
+        }
+        let path = self.get_mut(path_id)?;
+        let requested_state = request.requested_state();
+        path.set_state(requested_state)?;
+        if path.is_closing() {
+            self.mark_path_abandon(path_id, true);
+        }
+        Ok(())
+    }
+
     /// Sets the path with identifier 'path_id' to be active.
     ///
-    /// There can be exactly one active path on which non-probing packets can be
-    /// sent. If another path is marked as active, it will be superseded by the
-    /// one having `path_id` as identifier.
+    /// When multipath extensions are disabled, there can be exactly one active
+    /// path on which non-probing packets can be sent. If another path is marked
+    /// as active, it will be superseeded by the one having `path_id` as
+    /// identifier.
     ///
     /// A server should always ensure that the active path is validated. If it
-    /// is already the case, it notifies the application that the connection
-    /// migrated. Otherwise, it triggers a path validation and defers the
-    /// notification once it is actually validated.
+    /// is already the case, when the multipath extensions are disabled, it
+    /// notifies the application that the connection migrated. Otherwise, it
+    /// triggers a path validation and, if multipath extensions are disabled,
+    /// defers the notification once it is actually validated.
+    ///
+    /// When multipath extensions are enabled, this call is equivalent to
+    /// calling [`request()`] with `PathRequest::Active`.
+    ///
+    /// [`request()`]: struct.PathManager.html#method.request
     pub fn set_active_path(&mut self, path_id: usize) -> Result<()> {
         let is_server = self.is_server;
-
-        if let Ok(old_active_path) = self.get_active_mut() {
-            old_active_path.active = false;
+        let multipath = self.multipath;
+        if !multipath {
+            if let Ok(old_active_path) = self.get_active_mut() {
+                old_active_path.set_state(PathState::Unused)?;
+            }
         }
 
         let new_active_path = self.get_mut(path_id)?;
-        new_active_path.active = true;
+        new_active_path.set_state(PathState::Active)?;
 
         if is_server {
-            if new_active_path.validated() {
+            if new_active_path.validated() && !multipath {
                 let local_addr = new_active_path.local_addr();
                 let peer_addr = new_active_path.peer_addr();
-
-                self.notify_event(PathEvent::PeerMigrated(local_addr, peer_addr));
-            } else {
-                new_active_path.migrating = true;
-
+                self.notify_event(
+                    0,
+                    PathEvent::PeerMigrated(local_addr, peer_addr),
+                );
+            } else if !new_active_path.validated() {
+                new_active_path.migrating = !multipath;
                 // Requests path validation if needed.
                 if !new_active_path.under_validation() {
                     new_active_path.request_validation();
@@ -836,6 +1198,69 @@ impl PathMap {
         }
 
         Ok(())
+    }
+
+    /// Sets the provided `status` on he path identified by `path_id`.
+    pub fn set_path_status(
+        &mut self, path_id: usize, status: PathStatus,
+    ) -> Result<()> {
+        self.get_mut(path_id)?.status = status;
+        Ok(())
+    }
+
+    /// Requests the advertisement of a path status.
+    pub fn advertise_path_status(&mut self, path_id: usize) -> Result<()> {
+        let status = self.get(path_id)?.status;
+        self.path_status_to_advertise.push_back((
+            path_id,
+            self.next_path_status_seq_num,
+            status.into(),
+        ));
+        self.next_path_status_seq_num += 1;
+        Ok(())
+    }
+
+    /// Returns true if the host should send a PATH_STATUS frame.
+    #[inline]
+    pub fn has_path_status(&self) -> bool {
+        !self.path_status_to_advertise.is_empty()
+    }
+
+    /// Returns the Path ID, the sequence number and the availability
+    /// status (PATH_STANDBY or PATH_AVAILABLE) that should be advertised next.
+    pub fn path_status(&self) -> Option<(usize, u64, bool)> {
+        self.path_status_to_advertise.front().copied()
+    }
+
+    /// Handles the sending of PATH_STANDBY/PATH_AVAILABLE.
+    pub fn on_path_status_sent(&mut self) {
+        self.path_status_to_advertise.pop_front();
+    }
+
+    /// Are all paths in standby state?
+    pub fn all_available_paths_standby(&self) -> bool {
+        !self.paths.iter().all(|p| p.1.active() && !p.1.is_standby())
+    }
+
+    /// Handles the reception of PATH_STANDBY/PATH_AVAILABLE.
+    pub fn on_path_status_received(
+        &mut self, path_id: PathId, seq_num: u64, available: bool,
+    ) {
+        let pid = match self.pid_from_path_id(path_id) {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(p) = self.get_mut(pid) {
+            if seq_num >= p.expected_path_status_seq_num {
+                p.expected_path_status_seq_num = seq_num.saturating_add(1);
+                let path_id = p.path_id();
+                let addr = (p.local_addr(), p.peer_addr());
+                self.notify_event(
+                    path_id,
+                    PathEvent::PeerPathStatus(addr, available.into()),
+                );
+            }
+        }
     }
 }
 
@@ -847,6 +1272,9 @@ impl PathMap {
 /// [`path_stats()`]: struct.Connection.html#method.path_stats
 #[derive(Clone)]
 pub struct PathStats {
+    /// The explicit path ID of the path, if doing multipath.
+    pub path_id: PathId,
+
     /// The local address of the path.
     pub local_addr: SocketAddr,
 
@@ -855,6 +1283,9 @@ pub struct PathStats {
 
     /// The path validation state.
     pub validation_state: PathValidationState,
+
+    /// The path state.
+    pub state: PathState,
 
     /// Is it active?
     pub active: bool,
@@ -921,13 +1352,13 @@ impl std::fmt::Debug for PathStats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "local_addr={:?} peer_addr={:?} ",
-            self.local_addr, self.peer_addr,
+            "path_id={:x} local_addr={:?} peer_addr={:?} ",
+            self.path_id, self.local_addr, self.peer_addr,
         )?;
         write!(
             f,
-            "validation_state={:?} active={} ",
-            self.validation_state, self.active,
+            "validation_state={:?} state={:?} ",
+            self.validation_state, self.state,
         )?;
         write!(
             f,
@@ -969,6 +1400,7 @@ mod tests {
         let recovery_config = RecoveryConfig::from_config(&config);
 
         let path = Path::new(
+            0,
             client_addr,
             server_addr,
             &recovery_config,
@@ -979,6 +1411,7 @@ mod tests {
         let mut path_mgr = PathMap::new(path, 2, false, true, 1200);
 
         let probed_path = Path::new(
+            0,
             client_addr_2,
             server_addr,
             &recovery_config,
@@ -1049,7 +1482,7 @@ mod tests {
         );
         assert_eq!(
             path_mgr.pop_event(),
-            Some(PathEvent::Validated(client_addr_2, server_addr))
+            Some((0, PathEvent::Validated(client_addr_2, server_addr)))
         );
     }
 
@@ -1062,6 +1495,7 @@ mod tests {
         let recovery_config = RecoveryConfig::from_config(&config);
 
         let path = Path::new(
+            0,
             client_addr,
             server_addr,
             &recovery_config,
@@ -1071,6 +1505,7 @@ mod tests {
         );
         let mut client_path_mgr = PathMap::new(path, 2, false, false, 1200);
         let mut server_path = Path::new(
+            0,
             server_addr,
             client_addr,
             &recovery_config,
@@ -1154,6 +1589,7 @@ mod tests {
         let recovery_config = RecoveryConfig::from_config(&config);
 
         let path = Path::new(
+            0,
             client_addr,
             server_addr,
             &recovery_config,
@@ -1163,6 +1599,7 @@ mod tests {
         );
         let mut client_path_mgr = PathMap::new(path, 2, false, false, 1200);
         let mut server_path = Path::new(
+            0,
             server_addr,
             client_addr,
             &recovery_config,
@@ -1292,5 +1729,100 @@ mod tests {
         );
 
         // There will never be a response for fourth probe...
+    }
+
+    #[test]
+    fn path_priority() {
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+        let client_addr_2 = "127.0.0.1:2345".parse().unwrap();
+        let client_addr_3 = "127.0.0.1:3456".parse().unwrap();
+        let server_addr = "127.0.0.1:4321".parse().unwrap();
+
+        let config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        let recovery_config = RecoveryConfig::from_config(&config);
+
+        let path = Path::new(
+            0,
+            client_addr,
+            server_addr,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            MIN_CLIENT_INITIAL_LEN,
+            true,
+        );
+        let mut paths =
+            PathMap::new(path, 3, true, false, MIN_CLIENT_INITIAL_LEN);
+        let pid = paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .unwrap();
+
+        let path_2 = Path::new(
+            2,
+            client_addr_2,
+            server_addr,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            MIN_CLIENT_INITIAL_LEN,
+            false,
+        );
+        let pid_2 = paths.insert_path(path_2, false).unwrap();
+        let path_3 = Path::new(
+            4,
+            client_addr_3,
+            server_addr,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            MIN_CLIENT_INITIAL_LEN,
+            false,
+        );
+        let pid_3 = paths.insert_path(path_3, false).unwrap();
+
+        assert_eq!(paths.set_path_status(pid_2, PathStatus::Standby), Ok(()));
+        assert_eq!(
+            paths
+                .iter()
+                .filter_map(|(pid, p)| p.is_standby().then(|| pid))
+                .collect::<Vec<usize>>(),
+            vec![pid_2]
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .filter_map(|(pid, p)| (!p.is_standby()).then(|| pid))
+                .collect::<Vec<usize>>(),
+            vec![pid, pid_3]
+        );
+        assert_eq!(
+            paths.set_path_status(42, PathStatus::Standby),
+            Err(Error::InvalidState)
+        );
+
+        // Fake sending of PATH_STATUS frame.
+        paths.advertise_path_status(pid_2).unwrap();
+
+        // We can also fake send for another non-backup path.
+        paths.advertise_path_status(pid_3).unwrap();
+
+        assert_eq!(paths.has_path_status(), true);
+        assert_eq!(paths.path_status(), Some((pid_2, 0, false)));
+        paths.on_path_status_sent();
+        assert_eq!(paths.has_path_status(), true);
+        assert_eq!(paths.path_status(), Some((pid_3, 1, true)));
+        paths.on_path_status_sent();
+        assert_eq!(paths.has_path_status(), false);
+        assert_eq!(paths.path_status(), None);
+
+        assert_eq!(paths.set_path_status(pid_3, PathStatus::Standby), Ok(()));
+        assert_eq!(paths.set_path_status(pid_2, PathStatus::Available), Ok(()));
+        paths.advertise_path_status(pid_2).unwrap();
+        paths.advertise_path_status(pid_3).unwrap();
+        assert_eq!(paths.has_path_status(), true);
+        assert_eq!(paths.path_status(), Some((pid_2, 2, true)));
+        paths.on_path_status_sent();
+        assert_eq!(paths.has_path_status(), true);
+        assert_eq!(paths.path_status(), Some((pid_3, 3, false)));
+        paths.on_path_status_sent();
+        assert_eq!(paths.has_path_status(), false);
+        assert_eq!(paths.path_status(), None);
     }
 }
