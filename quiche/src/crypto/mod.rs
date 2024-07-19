@@ -479,9 +479,15 @@ fn hkdf_expand_label(
     Ok(())
 }
 
-fn make_nonce(iv: &[u8], counter: u64) -> [u8; aead::NONCE_LEN] {
+fn make_nonce(iv: &[u8], path_seq: u32, counter: u64) -> [u8; aead::NONCE_LEN] {
     let mut nonce = [0; aead::NONCE_LEN];
     nonce.copy_from_slice(iv);
+
+    // XOR the four first bytes of the IV with the path_seq. This is equivalent
+    // to right-padding the path_seq with zero bytes.
+    for (a, b) in nonce[0..4].iter_mut().zip(path_seq.to_be_bytes().iter()) {
+        *a ^= b;
+    }
 
     // XOR the last bytes of the IV with the counter. This is equivalent to
     // left-padding the counter with zero bytes.
@@ -622,6 +628,21 @@ mod tests {
             0x97, 0xd0, 0xef, 0xcb, 0x07, 0x6b, 0x0a, 0xb7, 0xa7, 0xa4,
         ];
         assert_eq!(&hdr_key, &expected_hdr_key);
+    }
+
+    #[test]
+    fn nonce() {
+        let iv = [
+            0x6b, 0x26, 0x11, 0x4b, 0x9c, 0xba, 0x2b, 0x63, 0xa9, 0xe8, 0xdd,
+            0x4f,
+        ];
+        let pn = 0xaead;
+        let path_seq = 3;
+        let nonce = make_nonce(&iv, path_seq, pn);
+        assert_eq!(nonce, [
+            0x6b, 0x26, 0x11, 0x48, 0x9c, 0xba, 0x2b, 0x63, 0xa9, 0xe8, 0x73,
+            0xe2
+        ]);
     }
 }
 
