@@ -123,6 +123,9 @@ fn main() {
     config.set_initial_congestion_window_packets(
         usize::try_from(conn_args.initial_cwnd_packets).unwrap(),
     );
+    if let Some(initial_max_paths) = conn_args.initial_max_paths {
+        config.set_initial_max_paths(initial_max_paths);
+    }
 
     config.set_max_connection_window(conn_args.max_window);
     config.set_max_stream_window(conn_args.max_stream_window);
@@ -523,14 +526,20 @@ fn main() {
                 clients_ids.remove(&retired_scid);
             }
 
-            // Provides as many CIDs as possible.
-            while client.conn.scids_left() > 0 {
-                let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-                if client.conn.new_scid(&scid, reset_token, false).is_err() {
-                    break;
-                }
+            for path_id in client.conn.path_ids() {
+                // Provides as many CIDs as possible.
+                while client.conn.scids_left_on_path(path_id) > 0 {
+                    let (scid, reset_token) = generate_cid_and_reset_token(&rng);
+                    if client
+                        .conn
+                        .new_scid_on_path(path_id, &scid, reset_token, false)
+                        .is_err()
+                    {
+                        break;
+                    }
 
-                clients_ids.insert(scid, client.client_id);
+                    clients_ids.insert(scid, client.client_id);
+                }
             }
         }
 
@@ -555,16 +564,24 @@ fn main() {
                     client.max_datagram_size *
                     client.max_datagram_size;
             let mut total_write = 0;
-            let mut dst_info = None;
+            let mut dst_info: Option<quiche::SendInfo> = None;
 
             while total_write < max_send_burst {
-                let (write, send_info) = match client
-                    .conn
-                    .send(&mut out[total_write..max_send_burst])
-                {
+                let res = match dst_info {
+                    Some(info) => client.conn.send_on_path(
+                        &mut out[total_write..max_send_burst],
+                        Some(info.from),
+                        Some(info.to),
+                    ),
+                    None =>
+                        client.conn.send(&mut out[total_write..max_send_burst]),
+                };
+
+                let (write, send_info) = match res {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
+                        continue_write = dst_info.is_some();
                         trace!("{} done writing", client.conn.trace_id());
                         break;
                     },
@@ -609,6 +626,14 @@ fn main() {
             }
 
             trace!("{} written {} bytes", client.conn.trace_id(), total_write);
+
+            if continue_write {
+                trace!(
+                    "{} pause writing and consider another path",
+                    client.conn.trace_id()
+                );
+                break;
+            }
 
             if total_write >= max_send_burst {
                 trace!("{} pause writing", client.conn.trace_id(),);
@@ -697,67 +722,95 @@ fn validate_token<'a>(
 }
 
 fn handle_path_events(client: &mut Client) {
-    while let Some(qe) = client.conn.path_event_next() {
+    while let Some((pid, qe)) = client.conn.path_event_next() {
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
                 info!(
-                    "{} Seen new path ({}, {})",
+                    "{} Seen new path ({}, {}) with ID {}",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
 
                 // Directly probe the new path.
                 client
                     .conn
                     .probe_path(local_addr, peer_addr)
-                    .expect("cannot probe");
+                    .map_err(|e| error!("cannot probe: {}", e))
+                    .ok();
             },
 
             quiche::PathEvent::Validated(local_addr, peer_addr) => {
                 info!(
-                    "{} Path ({}, {}) is now validated",
+                    "{} Path ({}, {}) with ID {} is now validated",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
+                if client.conn.is_multipath_enabled() {
+                    client
+                        .conn
+                        .set_active(local_addr, peer_addr, true)
+                        .map_err(|e| error!("cannot set path active: {}", e))
+                        .ok();
+                }
             },
 
             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
                 info!(
-                    "{} Path ({}, {}) failed validation",
+                    "{} Path ({}, {}) with ID {} failed validation",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
             },
 
-            quiche::PathEvent::Closed(local_addr, peer_addr, _err, _reason) => {
+            quiche::PathEvent::Closed(local_addr, peer_addr, err, reason) => {
                 info!(
-                    "{} Path ({}, {}) is now closed and unusable",
+                    "{} Path ({}, {}) with ID {} is now closed and unusable; err = {} reason = {:?}",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid,
+                    err,
+                    reason,
                 );
             },
 
             quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
                 info!(
-                    "{} Peer reused cid seq {} (initially {:?}) on {:?}",
+                    "{} Peer reused cid seq {} (initially {:?}) on {:?} on path ID {}",
                     client.conn.trace_id(),
                     cid_seq,
                     old,
-                    new
+                    new,
+                    pid
                 );
             },
 
             quiche::PathEvent::PeerMigrated(local_addr, peer_addr) => {
                 info!(
-                    "{} Connection migrated to ({}, {})",
+                    "{} Connection migrated to ({}, {}) on Path ID {}",
                     client.conn.trace_id(),
                     local_addr,
-                    peer_addr
+                    peer_addr,
+                    pid
                 );
+            },
+
+            quiche::PathEvent::PeerPathStatus(addr, path_status) => {
+                info!(
+                    "Peer asks status {:?} for {:?} on path ID {}",
+                    path_status, addr, pid
+                );
+                client
+                    .conn
+                    .set_path_status(addr.0, addr.1, path_status, false)
+                    .map_err(|e| error!("cannot follow status request: {}", e))
+                    .ok();
             },
         }
     }
