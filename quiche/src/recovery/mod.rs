@@ -856,6 +856,65 @@ impl Recovery {
         }
     }
 
+    pub fn mark_all_inflight_as_lost(
+        &mut self, now: Instant, trace_id: &str,
+    ) -> (usize, usize) {
+        let mut lost_packets = 0;
+        let mut lost_bytes = 0;
+        for &e in packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        ) {
+            let mut epoch_lost_bytes = 0;
+            let mut largest_lost_pkt = None;
+            let epoch = &mut self.epochs[e];
+            for sent in epoch.sent_packets.drain(..) {
+                if sent.time_acked.is_none() {
+                    epoch.lost_frames.extend_from_slice(&sent.frames);
+                    if sent.in_flight {
+                        epoch_lost_bytes += sent.size;
+
+                        epoch.in_flight_count =
+                            epoch.in_flight_count.saturating_sub(1);
+
+                        trace!(
+                            "{} packet {:?} lost on epoch {}",
+                            trace_id,
+                            sent.pkt_num,
+                            e
+                        );
+
+                        // Frames have already been removed from the packet.
+                        largest_lost_pkt = Some(sent);
+                    }
+
+                    lost_packets += 1;
+                    self.congestion.lost_count += 1;
+                }
+            }
+
+            self.bytes_lost += epoch_lost_bytes as u64;
+            lost_bytes += epoch_lost_bytes;
+
+            if let Some(pkt) = largest_lost_pkt {
+                if !self.congestion.in_congestion_recovery(pkt.time_sent) {
+                    (self.congestion.cc_ops.checkpoint)(&mut self.congestion);
+                }
+
+                (self.congestion.cc_ops.congestion_event)(
+                    &mut self.congestion,
+                    self.bytes_in_flight,
+                    epoch_lost_bytes,
+                    &pkt,
+                    now,
+                );
+
+                self.bytes_in_flight -= epoch_lost_bytes;
+            }
+        }
+
+        (lost_packets, lost_bytes)
+    }
+
     fn detect_lost_packets(
         &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str,
     ) -> (usize, usize) {
@@ -943,6 +1002,11 @@ impl Recovery {
 
     pub fn rtt_update_count(&self) -> usize {
         self.rtt_stats.rtt_update_count
+    }
+
+    #[allow(dead_code)]
+    pub fn bytes_sent(&self) -> usize {
+        self.bytes_sent
     }
 }
 
