@@ -8625,12 +8625,6 @@ impl Connection {
             }
         }
 
-        // We are at server side here. The path ID must be an even one.
-        if path_id % 2 != 0 {
-            error!("Peer tries to initiate an path with a server-initiated path ID {path_id}");
-            return Err(Error::MultiPathViolation);
-        }
-
         // This is a new path using an unassigned CID; create it!
         let mut path = path::Path::new(
             path_id,
