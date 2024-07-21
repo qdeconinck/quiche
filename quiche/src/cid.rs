@@ -1007,9 +1007,7 @@ impl ConnectionIdentifiers {
                         reset_token,
                     ),
                 )?;
-                if path_id % 2 == 0 {
-                    self.spare_path_ids.push(Reverse(path_id));
-                }
+                self.spare_path_ids.push(Reverse(path_id));
                 self.largest_path_id = self.largest_path_id.max(path_id);
                 (true, 0)
             },
