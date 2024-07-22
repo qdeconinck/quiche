@@ -97,6 +97,7 @@ pub fn connect(
 
     let mut rm_addrs = args.rm_addrs.clone();
     let mut status = args.status.clone();
+    let mut retire_dcids = args.retire_dcids.clone();
 
     // Create the configuration for the QUIC connection.
     let mut config = quiche::Config::new(args.version).unwrap();
@@ -537,6 +538,20 @@ pub fn connect(
                     info!("Advertising path status {status:?} to {addr:?}");
                     conn.set_path_status(*addr, peer_addr, status, true)
                         .is_err()
+                } else {
+                    true
+                }
+            });
+        }
+
+        if conn.is_established() {
+            retire_dcids.retain(|(d, path_id, cid_seq)| {
+                if conn.available_dcids_on_path(*path_id) > 0 && app_data_start.elapsed() >= *d {
+                    info!("retiring DCID sequence number {cid_seq} with path_id {path_id}");
+                    if let Err(e) = conn.retire_dcid_on_path(*path_id, *cid_seq) {
+                        error!("error when retiring DCID: {e:?}");
+                    }
+                    false
                 } else {
                     true
                 }
