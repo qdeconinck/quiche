@@ -27,6 +27,10 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use itertools::Itertools;
+use quiche::CIDSeq;
+use quiche::PathId;
+
 use super::common::alpns;
 
 pub trait Args {
@@ -300,8 +304,9 @@ Options:
   --perform-migration      Perform connection migration on another source port.
   --initial-max-path-id NUM   Enable multipath support up to the number of paths.
   -A --address ADDR ...    Specify addresses to be used instead of the unspecified address. Non-routable addresses will lead to connectivity issues.
-  -R --rm-addr TIMEADDR ...   Specify addresses to stop using after the provided time (format time,addr).
-  -S --status TIMEADDRSTAT ...   Specify availability status to advertise to the peer after the provided time (format time,addr,available).
+  -R --rm-addr TIMEADDR ...   Specify addresses to stop using after the provided time (format ms time,addr).
+  -S --status TIMEADDRSTAT ...   Specify availability status to advertise to the peer after the provided time (format ms time,addr,available).
+  -T --retire-dcid TIMEPIDCID ...   Specify CIDs to be retired on a specific path ID (format ms time,path id,CID).
   -H --header HEADER ...   Add a request header.
   -n --requests REQUESTS   Send the given number of identical requests [default: 1].
   --send-priority-update   Send HTTP/3 priority updates if the query string params 'u' or 'i' are present in URLs
@@ -334,6 +339,7 @@ pub struct ClientArgs {
     pub addrs: Vec<SocketAddr>,
     pub rm_addrs: Vec<(std::time::Duration, SocketAddr)>,
     pub status: Vec<(std::time::Duration, SocketAddr, bool)>,
+    pub retire_dcids: Vec<(std::time::Duration, PathId, CIDSeq)>,
 }
 
 impl Args for ClientArgs {
@@ -425,7 +431,7 @@ impl Args for ClientArgs {
                 if s.len() != 2 {
                     return None;
                 }
-                let secs = match s[0].parse::<u64>() {
+                let millis = match s[0].parse::<u64>() {
                     Ok(s) => s,
                     Err(_) => return None,
                 };
@@ -433,7 +439,7 @@ impl Args for ClientArgs {
                     Ok(a) => a,
                     Err(_) => return None,
                 };
-                Some((std::time::Duration::from_secs(secs), addr))
+                Some((std::time::Duration::from_millis(millis), addr))
             })
             .collect();
 
@@ -445,7 +451,7 @@ impl Args for ClientArgs {
                 if s.len() != 3 {
                     return None;
                 }
-                let secs = match s[0].parse::<u64>() {
+                let millis = match s[0].parse::<u64>() {
                     Ok(s) => s,
                     Err(_) => return None,
                 };
@@ -458,9 +464,33 @@ impl Args for ClientArgs {
                     Ok(_) => true,
                     Err(_) => return None,
                 };
-                Some((std::time::Duration::from_secs(secs), addr, status))
+                Some((std::time::Duration::from_millis(millis), addr, status))
             })
             .collect();
+
+        let retire_dcids = args
+            .get_vec("--retire-dcid")
+            .into_iter()
+            .filter_map(|ta| {
+                let s = ta.split(',').collect_vec();
+                if s.len() != 3 {
+                    return None;
+                }
+                let millis = match s[0].parse::<u64>() {
+                    Ok(s) => s,
+                    Err(_) => return None,
+                };
+                let path_id = match s[1].parse::<PathId>() {
+                    Ok(p) => p,
+                    Err(_) => return None,
+                };
+                let cid_seq = match s[2].parse::<CIDSeq>() {
+                    Ok(c) => c,
+                    Err(_) => return None,
+                };
+                Some((std::time::Duration::from_millis(millis), path_id, cid_seq))
+            })
+            .collect_vec();
 
         ClientArgs {
             version,
@@ -481,6 +511,7 @@ impl Args for ClientArgs {
             addrs,
             rm_addrs,
             status,
+            retire_dcids,
         }
     }
 }
@@ -506,6 +537,7 @@ impl Default for ClientArgs {
             addrs: vec![],
             rm_addrs: vec![],
             status: vec![],
+            retire_dcids: vec![],
         }
     }
 }
