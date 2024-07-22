@@ -3248,45 +3248,6 @@ impl Connection {
             }
         }
 
-        for path_id in self.path_id_to_abandon.drain(..) {
-            let (lost_packets, lost_bytes) = close_path(
-                &mut self.ids,
-                &mut self.pkt_num_spaces,
-                &mut self.paths,
-                path_id,
-                now,
-                &self.trace_id,
-            )?;
-            debug!("{} Close path succeeded", self.trace_id);
-            self.lost_count += lost_packets;
-            self.lost_bytes += lost_bytes as u64;
-        }
-
-        // Now that we processed all the frames, if there is a path that has no
-        // Destination CID, try to allocate one.
-        for (_, p) in self
-            .paths
-            .iter_mut()
-            .filter(|(_, p)| p.active_dcid_seq.is_none())
-        {
-            if self.ids.zero_length_dcid() {
-                p.active_dcid_seq = Some(0);
-                continue;
-            }
-
-            let dcid_seq = match self.ids.lowest_available_dcid_seq(p.path_id()) {
-                Some(seq) => seq,
-                None => break,
-            };
-
-            update_dcid(
-                &mut self.ids,
-                (p.local_addr(), p.peer_addr()),
-                p,
-                Some(dcid_seq),
-            )?;
-        }
-
         let pkt_num_space =
             self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
 
@@ -3327,9 +3288,6 @@ impl Connection {
             self.idle_timer = Some(now + idle_timeout);
         }
 
-        // Update send capacity.
-        self.update_tx_cap();
-
         self.recv_count += 1;
         self.paths.get_mut(recv_pid)?.recv_count += 1;
 
@@ -3348,6 +3306,53 @@ impl Connection {
         }
 
         self.ack_eliciting_sent = false;
+
+        // Because we may close the very current path, this should be done last.
+        for path_id in self.path_id_to_abandon.drain(..) {
+            debug!("{} abandonning path id {path_id}", self.trace_id);
+            let (lost_packets, lost_bytes) = close_path(
+                &mut self.ids,
+                &mut self.pkt_num_spaces,
+                &mut self.paths,
+                path_id,
+                now,
+                &self.trace_id,
+            )?;
+            debug!(
+                "{} close path with path_id {path_id} succeeded",
+                self.trace_id
+            );
+            self.lost_count += lost_packets;
+            self.lost_bytes += lost_bytes as u64;
+        }
+
+        // Now that we processed all the frames, if there is a path that has no
+        // Destination CID, try to allocate one.
+        for (_, p) in self
+            .paths
+            .iter_mut()
+            .filter(|(_, p)| p.active_dcid_seq.is_none())
+        {
+            if self.ids.zero_length_dcid() {
+                p.active_dcid_seq = Some(0);
+                continue;
+            }
+
+            let dcid_seq = match self.ids.lowest_available_dcid_seq(p.path_id()) {
+                Some(seq) => seq,
+                None => break,
+            };
+
+            update_dcid(
+                &mut self.ids,
+                (p.local_addr(), p.peer_addr()),
+                p,
+                Some(dcid_seq),
+            )?;
+        }
+
+        // Update send capacity.
+        self.update_tx_cap();
 
         Ok(read)
     }
