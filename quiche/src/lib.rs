@@ -707,6 +707,7 @@ impl Error {
             Error::CryptoBufferExceeded => -20,
             Error::UnavailablePath => -21,
             Error::MultiPathViolation => -22,
+            Error::OutOfPathId => -23,
         }
     }
 }

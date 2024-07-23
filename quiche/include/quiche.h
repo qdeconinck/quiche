@@ -763,17 +763,19 @@ int quiche_conn_new_scid(quiche_conn *conn,
 // Requests the stack to perform path validation of the proposed 4-tuple.
 int quiche_conn_probe_path(quiche_conn *conn,
                                 const struct sockaddr *local, socklen_t local_len,
-                                const struct sockaddr *peer, socklen_t peer_len, uint64_t *seq);
+                                const struct sockaddr *peer, socklen_t peer_len, uint64_t *path_id,
+                                uint64_t *cid_seq);
 
 // Migrates the connection to a new local address.
-int quiche_conn_migrate_source(quiche_conn *conn, const struct sockaddr *local, socklen_t local_len, uint64_t *seq);
+int quiche_conn_migrate_source(quiche_conn *conn, const struct sockaddr *local, socklen_t local_len,
+                                uint64_t *path_id, uint64_t *cid_seq);
 
 // Migrates the connection over the given network path between "local"
 // and "peer".
 int quiche_conn_migrate(quiche_conn *conn,
                              const struct sockaddr *local, socklen_t local_len,
                              const struct sockaddr *peer, socklen_t peer_len,
-                             uint64_t *seq);
+                             uint64_t *path_id, uint64_t *cid_seq);
 
 enum quiche_path_event_type {
     QUICHE_PATH_EVENT_NEW,
@@ -787,7 +789,7 @@ enum quiche_path_event_type {
 typedef struct quiche_path_event quiche_path_event;
 
 // Retrieves the next event. Returns NULL if there is no event to process.
-const quiche_path_event *quiche_conn_path_event_next(quiche_conn *conn);
+const quiche_path_event *quiche_conn_path_event_next(quiche_conn *conn, uint64_t *path_id);
 
 // Returns the type of the event.
 enum quiche_path_event_type quiche_path_event_type(quiche_path_event *ev);
