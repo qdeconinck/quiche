@@ -373,13 +373,14 @@ pub enum QuicFrameTypeName {
     ApplicationClose,
     HandshakeDone,
     Datagram,
-    MpAck,
+    PathAck,
     PathAbandon,
     PathAvailable,
-    PathStandby,
-    MpNewConnectionId,
-    MpRetireConnectionId,
+    PathBackup,
+    PathNewConnectionId,
+    PathRetireConnectionId,
     MaxPathId,
+    PathsBlocked,
     #[default]
     Unknown,
 }
@@ -515,7 +516,7 @@ pub enum QuicFrame {
         raw: Option<Bytes>,
     },
 
-    MpAck {
+    PathAck {
         path_identifier: u64,
 
         ack_delay: Option<f32>,
@@ -531,10 +532,9 @@ pub enum QuicFrame {
     PathAbandon {
         path_id: u64,
         error_code: u64,
-        reason: Option<String>,
     },
 
-    PathStandby {
+    PathBackup {
         path_id: u64,
         seq_num: u64,
     },
@@ -544,7 +544,7 @@ pub enum QuicFrame {
         seq_num: u64,
     },
 
-    MpNewConnectionId {
+    PathNewConnectionId {
         path_id: u64,
         sequence_number: u64,
         retire_prior_to: u64,
@@ -553,12 +553,16 @@ pub enum QuicFrame {
         stateless_reset_token: Option<StatelessResetToken>,
     },
 
-    MpRetireConnectionId {
+    PathRetireConnectionId {
         path_id: u64,
         sequence_number: u64,
     },
 
     MaxPathId {
+        max_path_id: u64,
+    },
+
+    PathsBlocked {
         max_path_id: u64,
     },
 
