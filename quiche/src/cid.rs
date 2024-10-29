@@ -1378,15 +1378,15 @@ impl ConnectionIdentifiers {
         self.zero_length_dcid
     }
 
-    /// Gets the (MP_)NEW_CONNECTION_ID frame related to the source connection
+    /// Gets the (PATH_)NEW_CONNECTION_ID frame related to the source connection
     /// ID with path ID `path_id` and sequence `seq_num`.
-    pub fn get_new_connection_id_frame_for(
+    pub fn get_path_connection_id_frame_for(
         &self, path_id: PathId, seq_num: CIDSeq,
     ) -> Result<frame::Frame> {
         let pcid = self.get_pcids(path_id).ok_or(Error::OutOfPathId)?;
         let e = pcid.scids.get(seq_num).ok_or(Error::InvalidState)?;
         if path_id != 0 {
-            Ok(frame::Frame::MpNewConnectionId {
+            Ok(frame::Frame::PathNewConnectionId {
                 path_id,
                 seq_num,
                 retire_prior_to: pcid.retire_prior_to,
@@ -1485,7 +1485,7 @@ impl ConnectionIdentifiers {
             return Ok(());
         }
         if path_id > self.max_path_id() {
-            return Err(Error::MultiPathViolation);
+            return Err(Error::PathIdViolation);
         }
         // We may close a path ID for which we have no state.
         if let Some(mut pcid) = self.pcids.remove(path_id, false)? {

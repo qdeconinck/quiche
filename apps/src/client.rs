@@ -447,10 +447,10 @@ pub fn connect(
                     );
                 },
 
-                quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                quiche::PathEvent::Closed(local_addr, peer_addr, e) => {
                     info!(
-                        "Path ({}, {}) with ID {} is now closed and unusable; err = {}, reason = {:?}",
-                        local_addr, peer_addr, pid, e, reason
+                        "Path ({}, {}) with ID {} is now closed and unusable; err = {}",
+                        local_addr, peer_addr, pid, e,
                     );
                 },
 
@@ -520,13 +520,7 @@ pub fn connect(
             rm_addrs.retain(|(d, addr)| {
                 if app_data_start.elapsed() >= *d {
                     info!("Abandoning path {:?}", addr);
-                    conn.abandon_path(
-                        *addr,
-                        peer_addr,
-                        0,
-                        "do not use me anymore".to_string().into_bytes(),
-                    )
-                    .is_err()
+                    conn.abandon_path(*addr, peer_addr, 0).is_err()
                 } else {
                     true
                 }
@@ -713,7 +707,7 @@ fn lowest_latency_scheduler(
 ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
     use itertools::Itertools;
     conn.path_stats()
-        .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        .filter(|p| !matches!(p.state, quiche::PathState::Closed(_)))
         .sorted_by_key(|p| p.rtt)
         .map(|p| (p.local_addr, p.peer_addr))
 }

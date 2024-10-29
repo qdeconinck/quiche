@@ -590,7 +590,7 @@ pub enum Error {
     UnavailablePath,
 
     /// Compliance error with the multipath extensions.
-    MultiPathViolation,
+    PathIdViolation,
 
     /// No spare Path Identifier to perform the operation in multipath.
     OutOfPathId,
@@ -706,7 +706,7 @@ impl Error {
             Error::KeyUpdate => -19,
             Error::CryptoBufferExceeded => -20,
             Error::UnavailablePath => -21,
-            Error::MultiPathViolation => -22,
+            Error::PathIdViolation => -22,
             Error::OutOfPathId => -23,
         }
     }
@@ -3186,13 +3186,13 @@ impl Connection {
                         }
                     },
 
-                    frame::Frame::MPACK {
+                    frame::Frame::PathAck {
                         path_identifier,
                         ranges,
                         ..
                     } => {
                         // Stop acknowledging packets less than or equal to the
-                        // largest acknowledged in the sent MP_ACK frame that,
+                        // largest acknowledged in the sent PATH_ACK frame that,
                         // in turn, got acked.
                         if let Some(largest_acked) = ranges.last() {
                             self.pkt_num_spaces
@@ -3784,18 +3784,20 @@ impl Connection {
                         p.pmtud.pmtu_probe_lost();
                     },
 
-                    frame::Frame::MpNewConnectionId {
-                        path_id, seq_num, ..
+                    frame::Frame::PathNewConnectionId {
+                        path_id,
+                        seq_num,
+                        ..
                     } => {
                         self.ids
                             .mark_advertise_new_scid_seq(path_id, seq_num, true);
                     },
 
-                    frame::Frame::MpRetireConnectionId { path_id, seq_num } => {
+                    frame::Frame::PathRetireConnectionId { path_id, seq_num } => {
                         self.ids.mark_retire_dcid_seq(path_id, seq_num, true)?;
                     },
 
-                    frame::Frame::MPACK {
+                    frame::Frame::PathAck {
                         path_identifier, ..
                     } => {
                         self.pkt_num_spaces
@@ -3812,7 +3814,7 @@ impl Connection {
             }
         }
 
-        let consider_standby_paths = self.paths.consider_standby_paths();
+        let consider_backup_paths = self.paths.consider_backup_paths();
         let is_app_limited = self.delivery_rate_check_if_app_limited(send_pid);
         let n_paths = self.paths.len();
         let flow_control = &mut self.flow_control;
@@ -3820,8 +3822,8 @@ impl Connection {
         let multipath_enabled = self.paths.multipath();
         let paths = &mut self.paths;
 
-        // Avoid being deadlocked if all available paths are standby.
-        if paths.all_available_paths_standby() {
+        // Avoid being deadlocked if all available paths are backup.
+        if paths.all_available_paths_backup() {
             // Force the availability of this path.
             paths.set_path_status(send_pid, PathStatus::Available)?;
         }
@@ -4021,14 +4023,14 @@ impl Connection {
             }
         }
 
-        // Create MP_ACK frames if needed.
+        // Create PATH_ACK frames if needed.
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
             path.active()
         {
-            // We first check if we should bundle the MP_ACK belonging to our
-            // path. We only bundle additional MP_ACK from other paths if we
-            // need to send one. This avoids sending MP_ACK frames endlessly.
+            // We first check if we should bundle the PATH_ACK belonging to our
+            // path. We only bundle additional PATH_ACK from other paths if we
+            // need to send one. This avoids sending PATH_ACK frames endlessly.
             let mut wrote_ack_mp = false;
             let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
             if pns.recv_pkt_need_ack.len() > 0 &&
@@ -4041,7 +4043,7 @@ impl Connection {
                         self.local_transport_params.ack_delay_exponent as u32,
                     );
 
-                let frame = frame::Frame::MPACK {
+                let frame = frame::Frame::PathAck {
                     path_identifier: path_id,
                     ack_delay,
                     ranges: pns.recv_pkt_need_ack.clone(),
@@ -4050,10 +4052,10 @@ impl Connection {
                 };
 
                 // When a PING frame needs to be sent, avoid sending the
-                // MP_ACK if there is not enough cwnd
+                // PATH_ACK if there is not enough cwnd
                 // available for both (note that PING
                 // frames are always 1 byte, so we just need to check that the
-                // MP_ACK's length is lower than cwnd).
+                // PATH_ACK's length is lower than cwnd).
                 if (pns.ack_elicited ||
                     (left_before_packing_ack_frame - left) + frame.wire_len() <
                         cwnd_available) &&
@@ -4089,7 +4091,7 @@ impl Connection {
                                     as u32,
                             );
 
-                        let frame = frame::Frame::MPACK {
+                        let frame = frame::Frame::PathAck {
                             path_identifier: space_id,
                             ack_delay,
                             ranges: pns.recv_pkt_need_ack.clone(),
@@ -4105,10 +4107,8 @@ impl Connection {
                             push_frame_to_pkt!(b, frames, frame, left)
                         {
                             // Continue advertising until we send the
-                            // MP_ACK
-                            // on
-                            // its own path, unless the path is not
-                            // active.
+                            // PATH_ACK on its own path, unless the
+                            // path is not active.
                             if let Some(path_id) = pns_path_id {
                                 if !paths.get(path_id)?.active() {
                                     pns.ack_elicited = false;
@@ -4247,8 +4247,9 @@ impl Connection {
             while let Some((path_id, seq_num)) =
                 self.ids.next_advertise_new_scid_seq()
             {
-                let frame =
-                    self.ids.get_new_connection_id_frame_for(path_id, seq_num)?;
+                let frame = self
+                    .ids
+                    .get_path_connection_id_frame_for(path_id, seq_num)?;
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.ids
@@ -4455,7 +4456,7 @@ impl Connection {
                 }
 
                 let frame = if path_id != 0 {
-                    frame::Frame::MpRetireConnectionId { path_id, seq_num }
+                    frame::Frame::PathRetireConnectionId { path_id, seq_num }
                 } else {
                     frame::Frame::RetireConnectionId { seq_num }
                 };
@@ -4474,12 +4475,10 @@ impl Connection {
             while let Some(pid) = self.paths.path_abandon() {
                 let abandoned_path = self.paths.get(pid)?;
                 let path_id = abandoned_path.path_id();
-                let (error_code, reason) =
-                    abandoned_path.closing_error_code_and_reason()?;
+                let error_code = abandoned_path.closing_error_code()?;
                 let frame = frame::Frame::PathAbandon {
                     path_id,
                     error_code,
-                    reason,
                 };
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.paths.on_path_abandon_sent(pid, now)?;
@@ -4507,7 +4506,7 @@ impl Connection {
                 }
             }
 
-            // Create PATH_AVAILABLE/PATH_STANDBY frames as needed.
+            // Create PATH_AVAILABLE/PATH_BACKUP frames as needed.
             while let Some((path_id, seq_num, available)) =
                 self.paths.path_status()
             {
@@ -4516,7 +4515,7 @@ impl Connection {
                 let frame = if available {
                     frame::Frame::PathAvailable { path_id, seq_num }
                 } else {
-                    frame::Frame::PathStandby { path_id, seq_num }
+                    frame::Frame::PathBackup { path_id, seq_num }
                 };
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.paths.on_path_status_sent();
@@ -4737,7 +4736,7 @@ impl Connection {
             !is_closing &&
             path.active() &&
             !dgram_emitted &&
-            (consider_standby_paths || !path.is_standby())
+            (consider_backup_paths || !path.is_backup())
         {
             while let Some(priority_key) = self.streams.peek_flushable() {
                 let stream_id = priority_key.id;
@@ -6577,14 +6576,13 @@ impl Connection {
     /// [`Done`]: enum.Error.html#Done
     pub fn abandon_path(
         &mut self, local: SocketAddr, peer: SocketAddr, err_code: u64,
-        reason: Vec<u8>,
     ) -> Result<()> {
         let pid = self
             .paths
             .path_id_from_addrs(&(local, peer))
             .ok_or(Error::Done)?;
         self.paths
-            .request(pid, path::PathRequest::Abandon(err_code, reason))?;
+            .request(pid, path::PathRequest::Abandon(err_code))?;
 
         // After any path state change, check for the transmission rate.
         self.update_tx_cap();
@@ -6627,7 +6625,7 @@ impl Connection {
     ///
     /// When `path_id` is `0`, it triggers sending of NEW_CONNECTION_ID frames,
     /// while when `path_id` is different from `0` and multipath extensions are
-    /// enabled, this triggers the sending of MP_NEW_CONNECTION_ID frames.
+    /// enabled, this triggers the sending of PATH_NEW_CONNECTION_ID frames.
     ///
     /// At any time, the peer cannot have more Destination Connection IDs than
     /// the maximum number of active Connection IDs it negotiated. In such case
@@ -6764,7 +6762,7 @@ impl Connection {
     /// host to reach its peer over a given PathId.
     ///
     /// This triggers sending RETIRE_CONNECTION_ID frames when the PathID is 0,
-    /// or MP_RETIRE_CONNECTION_ID frames when PathId is not 0 and multipath
+    /// or PATH_RETIRE_CONNECTION_ID frames when PathId is not 0 and multipath
     /// extension is enabled.
     ///
     /// If the application tries to retire a non-existing Destination Connection
@@ -8199,14 +8197,14 @@ impl Connection {
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
 
-            frame::Frame::MPACK {
+            frame::Frame::PathAck {
                 path_identifier,
                 ranges,
                 ack_delay,
                 ..
             } => {
                 if !self.use_path_pkt_num_space(epoch) {
-                    return Err(Error::MultiPathViolation);
+                    return Err(Error::PathIdViolation);
                 }
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
@@ -8224,20 +8222,19 @@ impl Connection {
 
                 let handshake_status = self.handshake_status();
 
-                // If an endpoint receives an MP_ACK frame with a packet number
-                // space ID which was never issued by endpoints (i.e., with a
-                // sequence number larger than the largest one advertised), it
-                // MUST treat this as a connection error of type
-                // MP_PROTOCOL_VIOLATION and close the connection.
+                // Receipt of multipath-specific frames that use a Path ID that
+                // is greater than the announced Maximum Paths value in the
+                // MAX_PATH_ID frame or in the initial_max_path_id transport
+                // parameter, if no MAX_PATH_ID frame was received yet, MUST be
+                // treated as a connection error of type PROTOCOL_VIOLATION.
                 if path_identifier > self.ids.largest_path_id() {
-                    return Err(Error::MultiPathViolation);
+                    return Err(Error::PathIdViolation);
                 }
 
-                // If an endpoint receives an MP_ACK frame with a packet number
-                // space ID which is no more active (e.g., retired by a
-                // RETIRE_CONNECTION_ID frame or belonging to closed paths), it
-                // MUST ignore the MP_ACK frame without causing a connection
-                // error.
+                // If an endpoint receives a multipath-specific frame with a
+                // path identifier that it cannot process anymore (e.g., because
+                // the path might have been abandoned), it MUST silently ignore
+                // the frame.
                 if let Some(path_id) =
                     self.paths.pid_from_path_id(path_identifier)
                 {
@@ -8270,36 +8267,33 @@ impl Connection {
             frame::Frame::PathAbandon {
                 path_id,
                 error_code,
-                reason,
-                ..
             } => {
                 if !self.use_path_pkt_num_space(epoch) {
-                    return Err(Error::MultiPathViolation);
+                    return Err(Error::PathIdViolation);
                 }
 
                 if path_id > self.ids.largest_path_id() {
                     return Err(Error::InvalidFrame);
                 }
 
-                self.paths
-                    .on_path_abandon_received(path_id, error_code, reason)?;
+                self.paths.on_path_abandon_received(path_id, error_code)?;
             },
 
-            frame::Frame::PathStandby { path_id, seq_num } => {
+            frame::Frame::PathBackup { path_id, seq_num } => {
                 if !self.use_path_pkt_num_space(epoch) {
-                    return Err(Error::MultiPathViolation);
+                    return Err(Error::PathIdViolation);
                 }
                 self.paths.on_path_status_received(path_id, seq_num, false);
             },
 
             frame::Frame::PathAvailable { path_id, seq_num } => {
                 if !self.use_path_pkt_num_space(epoch) {
-                    return Err(Error::MultiPathViolation);
+                    return Err(Error::PathIdViolation);
                 }
                 self.paths.on_path_status_received(path_id, seq_num, true);
             },
 
-            frame::Frame::MpNewConnectionId {
+            frame::Frame::PathNewConnectionId {
                 path_id,
                 seq_num,
                 retire_prior_to,
@@ -8307,7 +8301,7 @@ impl Connection {
                 reset_token,
             } => {
                 if !self.use_path_pkt_num_space(epoch) {
-                    return Err(Error::MultiPathViolation);
+                    return Err(Error::PathIdViolation);
                 }
 
                 let mut retired_path_ids = SmallVec::new();
@@ -8357,7 +8351,7 @@ impl Connection {
                 new_dcid_res?;
             },
 
-            frame::Frame::MpRetireConnectionId { path_id, seq_num } => {
+            frame::Frame::PathRetireConnectionId { path_id, seq_num } => {
                 if self.ids.zero_length_scid() {
                     return Err(Error::InvalidState);
                 }
@@ -8381,6 +8375,8 @@ impl Connection {
             frame::Frame::MaxPathId { max_path_id } => {
                 self.ids.set_remote_max_path_id(max_path_id);
             },
+
+            frame::Frame::PathsBlocked { .. } => {},
         };
         Ok(())
     }
@@ -8677,12 +8673,12 @@ impl Connection {
             }
         }
 
-        let mut consider_standby = false;
+        let mut consider_backup = false;
         let dgrams_to_emit = self.dgram_send_queue.has_pending();
         let stream_to_emit = self.streams.has_flushable();
         // When using aggregate mode, favour lowest-latency path on which CWIN
         // is open. This should only be used when data need to be sent.
-        // If we have standby paths, we may run the loop a second time.
+        // If we have backup paths, we may run the loop a second time.
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
             // We loop at most twice.
             loop {
@@ -8693,8 +8689,8 @@ impl Connection {
                         // Follow the filter provided as parameters.
                         let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
                         let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
-                        // Favour non-standby paths first, only consider active ones with open CWND.
-                        local && peer && (consider_standby || !p.is_standby()) && p.active() && p.recovery.cwnd_available() > 0
+                        // Favour non-backup paths first, only consider active ones with open CWND.
+                        local && peer && (consider_backup || !p.is_backup()) && p.active() && p.recovery.cwnd_available() > 0
                     })
                     // Lowest-latency first.
                     .min_by_key(|(_, p)| p.recovery.rtt())
@@ -8702,14 +8698,14 @@ impl Connection {
                 {
                     return Ok(pid);
                 }
-                if consider_standby || !self.paths.consider_standby_paths() {
+                if consider_backup || !self.paths.consider_backup_paths() {
                     break;
                 }
-                consider_standby = true;
+                consider_backup = true;
             }
         }
 
-        // When using multiple packet number spaces, let's force MP_ACK sending
+        // When using multiple packet number spaces, let's force PATH_ACK sending
         // on their corresponding paths.
         if self.is_multipath_enabled() {
             if let Some(pid) = self
@@ -9341,7 +9337,7 @@ impl TransportParams {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
 
-                0x0f739bbc1b666d09 => {
+                0x0f739bbc1b666d11 => {
                     tp.initial_max_path_id = Some(val.get_varint()?);
                 },
 
@@ -9510,7 +9506,7 @@ impl TransportParams {
         if let Some(initial_max_path_id) = tp.initial_max_path_id {
             TransportParams::encode_param(
                 &mut b,
-                0x0f739bbc1b666d09,
+                0x0f739bbc1b666d11,
                 octets::varint_len(initial_max_path_id),
             )?;
             b.put_varint(initial_max_path_id)?;
@@ -18848,7 +18844,7 @@ mod tests {
         assert_eq!(path_s2c_0.active(), true);
         assert_eq!(path_s2c_1.active(), true);
 
-        // Flush the MP_ACK on the newly active path.
+        // Flush the PATH_ACK on the newly active path.
         assert_eq!(pipe.advance(), Ok(()));
 
         // Emit enough data to use both paths, but no more than their initial
@@ -18877,16 +18873,11 @@ mod tests {
         assert!(path_s2c_0.recovery.bytes_sent() >= DATA_BYTES / 2);
         assert!(path_s2c_1.recovery.bytes_sent() >= DATA_BYTES / 2);
 
-        // TODO: need to test MP_RETIRE_CONNECTION_ID.
+        // TODO: need to test PATH_RETIRE_CONNECTION_ID.
 
         // Now close the initial path.
         assert_eq!(
-            pipe.client.abandon_path(
-                client_addr,
-                server_addr,
-                0,
-                "no error".into(),
-            ),
+            pipe.client.abandon_path(client_addr, server_addr, 0,),
             Ok(()),
         );
 
@@ -18930,10 +18921,7 @@ mod tests {
 
         assert_eq!(
             pipe.server.path_event_next(),
-            Some((
-                0,
-                PathEvent::Closed(server_addr, client_addr, 0, "no error".into(),)
-            ))
+            Some((0, PathEvent::Closed(server_addr, client_addr, 0)))
         );
 
         assert_eq!(
@@ -18944,10 +18932,7 @@ mod tests {
 
         assert_eq!(
             pipe.client.path_event_next(),
-            Some((
-                0,
-                PathEvent::Closed(client_addr, server_addr, 0, "no error".into(),)
-            ))
+            Some((0, PathEvent::Closed(client_addr, server_addr, 0)))
         );
 
         let cid_c2s_4 =
@@ -18956,7 +18941,7 @@ mod tests {
             pipe.server.destination_id_on_path(4).unwrap().into_owned();
 
         // Retire the DCID of Path ID 4 we did not use, to exercise
-        // MP_RETIRE_CONNECTION_ID.
+        // PATH_RETIRE_CONNECTION_ID.
         assert_eq!(pipe.client.retire_dcid_on_path(4, 0), Ok(()),);
         assert_eq!(pipe.server.retire_dcid_on_path(4, 0), Ok(()),);
 

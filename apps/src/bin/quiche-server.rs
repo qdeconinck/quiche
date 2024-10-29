@@ -769,15 +769,14 @@ fn handle_path_events(client: &mut Client) {
                 );
             },
 
-            quiche::PathEvent::Closed(local_addr, peer_addr, err, reason) => {
+            quiche::PathEvent::Closed(local_addr, peer_addr, err) => {
                 info!(
-                    "{} Path ({}, {}) with ID {} is now closed and unusable; err = {} reason = {:?}",
+                    "{} Path ({}, {}) with ID {} is now closed and unusable; err = {}",
                     client.conn.trace_id(),
                     local_addr,
                     peer_addr,
                     pid,
                     err,
-                    reason,
                 );
             },
 

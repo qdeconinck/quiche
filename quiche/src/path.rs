@@ -83,9 +83,9 @@ pub enum PathState {
     /// The path can send non-probing packets.
     Active,
     /// The path is under closing process.
-    Closing(u64, Vec<u8>),
+    Closing(u64),
     /// The path is now closed.
-    Closed(u64, Vec<u8>),
+    Closed(u64),
 }
 
 /// The different requests that can be assigned to a path.
@@ -95,9 +95,8 @@ pub enum PathRequest {
     Unused,
     /// The path should send probing packets.
     Active,
-    /// The path should be abandonned, with the provided error code and reason
-    /// message.
-    Abandon(u64, Vec<u8>),
+    /// The path should be abandonned, with the provided error code.
+    Abandon(u64),
 }
 
 impl PathRequest {
@@ -105,7 +104,7 @@ impl PathRequest {
         match self {
             PathRequest::Unused => PathState::Unused,
             PathRequest::Active => PathState::Active,
-            PathRequest::Abandon(e, r) => PathState::Closing(e, r),
+            PathRequest::Abandon(e) => PathState::Closing(e),
         }
     }
 }
@@ -155,8 +154,8 @@ pub enum PathEvent {
 
     /// The related network path between local `SocketAddr` and peer
     /// `SocketAddr` has been closed and is now unusable on this connection.
-    /// An error code and a reason message are provided.
-    Closed(SocketAddr, SocketAddr, u64, Vec<u8>),
+    /// An error code is provided.
+    Closed(SocketAddr, SocketAddr, u64),
 
     /// The stack observes that the Source Connection ID with the given sequence
     /// number, initially used by the peer over the first pair of `SocketAddr`s,
@@ -388,13 +387,13 @@ impl Path {
     /// Returns whether this path is under closing process.
     #[inline]
     pub fn is_closing(&self) -> bool {
-        matches!(self.state, PathState::Closing(_, _))
+        matches!(self.state, PathState::Closing(_))
     }
 
     /// Returns whether this path is closed.
     #[inline]
     fn closed(&self) -> bool {
-        matches!(self.state, PathState::Closed(_, _))
+        matches!(self.state, PathState::Closed(_))
     }
 
     /// Promotes the path to the provided validation state only if the new state
@@ -527,10 +526,9 @@ impl Path {
         self.closing_timer = None;
     }
 
-    pub fn closing_error_code_and_reason(&self) -> Result<(u64, Vec<u8>)> {
+    pub fn closing_error_code(&self) -> Result<u64> {
         match &self.state {
-            PathState::Closing(e, r) | PathState::Closed(e, r) =>
-                Ok((*e, r.clone())),
+            PathState::Closing(e) | PathState::Closed(e) => Ok(*e),
             _ => Err(Error::InvalidState),
         }
     }
@@ -637,7 +635,7 @@ impl Path {
     }
 
     #[inline]
-    pub fn is_standby(&self) -> bool {
+    pub fn is_backup(&self) -> bool {
         matches!(self.status, PathStatus::Standby)
     }
 
@@ -720,7 +718,7 @@ pub struct PathMap {
     path_abandon: VecDeque<usize>,
 
     /// Whether a connection-wide PATH_STATUS frame should be sent.
-    /// Send a PATH_AVAILABLE is true, PATH_STANDBY else.
+    /// Send a PATH_AVAILABLE is true, otherwise PATH_BACKUP.
     path_status_to_advertise: VecDeque<(usize, u64, bool)>,
     /// The sequence number for the next PATH_STATUS.
     next_path_status_seq_num: u64,
@@ -888,12 +886,7 @@ impl PathMap {
 
         self.notify_event(
             path.path_id,
-            PathEvent::Closed(
-                path.local_addr,
-                path.peer_addr,
-                0,
-                "unused path".into(),
-            ),
+            PathEvent::Closed(path.local_addr, path.peer_addr, 0),
         );
 
         Ok(())
@@ -983,10 +976,10 @@ impl PathMap {
             .iter_mut()
             .filter(|(_, p)| p.closed() && !p.failure_notified)
         {
-            if let PathState::Closed(e, r) = &p.state {
+            if let PathState::Closed(e) = &p.state {
                 events.push_back((
                     p.path_id(),
-                    PathEvent::Closed(p.local_addr, p.peer_addr, *e, r.clone()),
+                    PathEvent::Closed(p.local_addr, p.peer_addr, *e),
                 ));
                 p.failure_notified = true;
             }
@@ -1002,9 +995,9 @@ impl PathMap {
             .map(|(pid, _)| pid)
     }
 
-    /// Returns whether standby paths should be considered to send data packets.
-    pub fn consider_standby_paths(&self) -> bool {
-        self.iter().filter(|(_, p)| !p.is_standby()).count() == 0
+    /// Returns whether backup paths should be considered to send data packets.
+    pub fn consider_backup_paths(&self) -> bool {
+        self.iter().filter(|(_, p)| !p.is_backup()).count() == 0
     }
 
     /// Handles incoming PATH_RESPONSE data.
@@ -1058,18 +1051,18 @@ impl PathMap {
         let path_id = path.path_id;
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
-        let to_notify = if let PathState::Closing(e, r) = &mut path.state {
-            let to_notify = Some((*e, r.clone()));
-            path.state = PathState::Closed(*e, std::mem::take(r));
+        let to_notify = if let PathState::Closing(e) = &mut path.state {
+            let to_notify = Some(*e);
+            path.state = PathState::Closed(*e);
             to_notify
         } else {
             None
         };
         let lost_info = path.recovery.mark_all_inflight_as_lost(now, trace_id);
-        if let Some((e, r)) = to_notify {
+        if let Some(e) = to_notify {
             self.notify_event(
                 path_id,
-                PathEvent::Closed(local_addr, peer_addr, e, r),
+                PathEvent::Closed(local_addr, peer_addr, e),
             );
         }
         lost_info
@@ -1077,7 +1070,7 @@ impl PathMap {
 
     /// Handles incoming PATH_ABANDONs.
     pub fn on_path_abandon_received(
-        &mut self, abandon_path_id: PathId, error_code: u64, reason: Vec<u8>,
+        &mut self, abandon_path_id: PathId, error_code: u64,
     ) -> Result<()> {
         let is_server = self.is_server;
         let nb_paths = self.paths.len();
@@ -1099,7 +1092,7 @@ impl PathMap {
             return Ok(());
         }
         let was_closing = abandon_path.is_closing();
-        abandon_path.set_state(PathState::Closing(error_code, reason))?;
+        abandon_path.set_state(PathState::Closing(error_code))?;
         abandon_path.on_abandon_received();
         if !was_closing {
             self.mark_path_abandon(abandon_pid, true);
@@ -1227,22 +1220,22 @@ impl PathMap {
     }
 
     /// Returns the Path ID, the sequence number and the availability
-    /// status (PATH_STANDBY or PATH_AVAILABLE) that should be advertised next.
+    /// status (PATH_BACKUP or PATH_AVAILABLE) that should be advertised next.
     pub fn path_status(&self) -> Option<(usize, u64, bool)> {
         self.path_status_to_advertise.front().copied()
     }
 
-    /// Handles the sending of PATH_STANDBY/PATH_AVAILABLE.
+    /// Handles the sending of PATH_BACKUP/PATH_AVAILABLE.
     pub fn on_path_status_sent(&mut self) {
         self.path_status_to_advertise.pop_front();
     }
 
-    /// Are all paths in standby state?
-    pub fn all_available_paths_standby(&self) -> bool {
-        !self.paths.iter().all(|p| p.1.active() && !p.1.is_standby())
+    /// Are all paths in backup state?
+    pub fn all_available_paths_backup(&self) -> bool {
+        !self.paths.iter().all(|p| p.1.active() && !p.1.is_backup())
     }
 
-    /// Handles the reception of PATH_STANDBY/PATH_AVAILABLE.
+    /// Handles the reception of PATH_BACKUP/PATH_AVAILABLE.
     pub fn on_path_status_received(
         &mut self, path_id: PathId, seq_num: u64, available: bool,
     ) {
@@ -1781,14 +1774,14 @@ mod tests {
         assert_eq!(
             paths
                 .iter()
-                .filter_map(|(pid, p)| p.is_standby().then(|| pid))
+                .filter_map(|(pid, p)| p.is_backup().then(|| pid))
                 .collect::<Vec<usize>>(),
             vec![pid_2]
         );
         assert_eq!(
             paths
                 .iter()
-                .filter_map(|(pid, p)| (!p.is_standby()).then(|| pid))
+                .filter_map(|(pid, p)| (!p.is_backup()).then(|| pid))
                 .collect::<Vec<usize>>(),
             vec![pid, pid_3]
         );

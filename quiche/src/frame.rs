@@ -185,7 +185,7 @@ pub enum Frame {
         length: usize,
     },
 
-    MPACK {
+    PathAck {
         path_identifier: u64,
         ack_delay: u64,
         ranges: ranges::RangeSet,
@@ -195,10 +195,9 @@ pub enum Frame {
     PathAbandon {
         path_id: u64,
         error_code: u64,
-        reason: Vec<u8>,
     },
 
-    PathStandby {
+    PathBackup {
         path_id: u64,
         seq_num: u64,
     },
@@ -208,7 +207,7 @@ pub enum Frame {
         seq_num: u64,
     },
 
-    MpNewConnectionId {
+    PathNewConnectionId {
         path_id: u64,
         seq_num: u64,
         retire_prior_to: u64,
@@ -216,12 +215,16 @@ pub enum Frame {
         reset_token: [u8; 16],
     },
 
-    MpRetireConnectionId {
+    PathRetireConnectionId {
         path_id: u64,
         seq_num: u64,
     },
 
     MaxPathId {
+        max_path_id: u64,
+    },
+
+    PathsBlocked {
         max_path_id: u64,
     },
 }
@@ -371,15 +374,14 @@ impl Frame {
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
-            0x15228c00..=0x15228c01 => parse_mp_ack_frame(frame_type, b)?,
+            0x15228c00..=0x15228c01 => parse_path_ack_frame(frame_type, b)?,
 
             0x15228c05 => Frame::PathAbandon {
                 path_id: b.get_varint()?,
                 error_code: b.get_varint()?,
-                reason: b.get_bytes_with_varint_length()?.to_vec(),
             },
 
-            0x15228c07 => Frame::PathStandby {
+            0x15228c07 => Frame::PathBackup {
                 path_id: b.get_varint()?,
                 seq_num: b.get_varint()?,
             },
@@ -399,7 +401,7 @@ impl Frame {
                     return Err(Error::InvalidFrame);
                 }
 
-                Frame::MpNewConnectionId {
+                Frame::PathNewConnectionId {
                     path_id,
                     seq_num,
                     retire_prior_to,
@@ -412,12 +414,16 @@ impl Frame {
                 }
             },
 
-            0x15228c0a => Frame::MpRetireConnectionId {
+            0x15228c0a => Frame::PathRetireConnectionId {
                 path_id: b.get_varint()?,
                 seq_num: b.get_varint()?,
             },
 
             0x15228c0c => Frame::MaxPathId {
+                max_path_id: b.get_varint()?,
+            },
+
+            0x15228c0d => Frame::PathsBlocked {
                 max_path_id: b.get_varint()?,
             },
 
@@ -438,13 +444,15 @@ impl Frame {
             (packet::Type::ZeroRTT, Frame::PathResponse { .. }) => false,
             (packet::Type::ZeroRTT, Frame::RetireConnectionId { .. }) => false,
             (packet::Type::ZeroRTT, Frame::ConnectionClose { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::MPACK { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathAck { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathAbandon { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::PathStandby { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathBackup { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathAvailable { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::MpNewConnectionId { .. }) => false,
-            (packet::Type::ZeroRTT, Frame::MpRetireConnectionId { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathNewConnectionId { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathRetireConnectionId { .. }) =>
+                false,
             (packet::Type::ZeroRTT, Frame::MaxPathId { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathsBlocked { .. }) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -666,7 +674,7 @@ impl Frame {
 
             Frame::DatagramHeader { .. } => (),
 
-            Frame::MPACK {
+            Frame::PathAck {
                 path_identifier,
                 ack_delay,
                 ranges,
@@ -684,17 +692,14 @@ impl Frame {
             Frame::PathAbandon {
                 path_id,
                 error_code,
-                reason,
             } => {
                 b.put_varint(0x15228c05)?;
 
                 b.put_varint(*path_id)?;
                 b.put_varint(*error_code)?;
-                b.put_varint(reason.len() as u64)?;
-                b.put_bytes(reason.as_ref())?;
             },
 
-            Frame::PathStandby { path_id, seq_num } => {
+            Frame::PathBackup { path_id, seq_num } => {
                 b.put_varint(0x15228c07)?;
 
                 b.put_varint(*path_id)?;
@@ -708,7 +713,7 @@ impl Frame {
                 b.put_varint(*seq_num)?;
             },
 
-            Frame::MpNewConnectionId {
+            Frame::PathNewConnectionId {
                 path_id,
                 seq_num,
                 retire_prior_to,
@@ -725,7 +730,7 @@ impl Frame {
                 b.put_bytes(reset_token.as_ref())?;
             },
 
-            Frame::MpRetireConnectionId { path_id, seq_num } => {
+            Frame::PathRetireConnectionId { path_id, seq_num } => {
                 b.put_varint(0x15228c0a)?;
 
                 b.put_varint(*path_id)?;
@@ -734,6 +739,12 @@ impl Frame {
 
             Frame::MaxPathId { max_path_id } => {
                 b.put_varint(0x15228c0c)?;
+
+                b.put_varint(*max_path_id)?;
+            },
+
+            Frame::PathsBlocked { max_path_id } => {
+                b.put_varint(0x15228c0d)?;
 
                 b.put_varint(*max_path_id)?;
             },
@@ -925,7 +936,7 @@ impl Frame {
                 *length // data
             },
 
-            Frame::MPACK {
+            Frame::PathAck {
                 path_identifier,
                 ack_delay,
                 ranges,
@@ -939,16 +950,13 @@ impl Frame {
             Frame::PathAbandon {
                 path_id,
                 error_code,
-                reason,
             } => {
                 4 + // frame type
                 octets::varint_len(*path_id) +
-                octets::varint_len(*error_code) +
-                octets::varint_len(reason.len() as u64) + // reason_len
-                reason.len()
+                octets::varint_len(*error_code)
             },
 
-            Frame::PathStandby { path_id, seq_num } => {
+            Frame::PathBackup { path_id, seq_num } => {
                 4 + // frame size
                 octets::varint_len(*path_id) +
                 octets::varint_len(*seq_num)
@@ -960,7 +968,7 @@ impl Frame {
                 octets::varint_len(*seq_num)
             },
 
-            Frame::MpNewConnectionId {
+            Frame::PathNewConnectionId {
                 path_id,
                 seq_num,
                 retire_prior_to,
@@ -976,12 +984,18 @@ impl Frame {
                 reset_token.len() // reset_token
             },
 
-            Frame::MpRetireConnectionId { path_id, seq_num } => {
+            Frame::PathRetireConnectionId { path_id, seq_num } => {
                 4 + // frame type
                 octets::varint_len(*path_id) + // path_id
                 octets::varint_len(*seq_num) // seq_num
             },
+
             Frame::MaxPathId { max_path_id } => {
+                4 + // frame type
+                octets::varint_len(*max_path_id) // path_id
+            },
+
+            Frame::PathsBlocked { max_path_id } => {
                 4 + // frame type
                 octets::varint_len(*max_path_id) // path_id
             },
@@ -996,7 +1010,7 @@ impl Frame {
                 Frame::ACK { .. } |
                 Frame::ApplicationClose { .. } |
                 Frame::ConnectionClose { .. } |
-                Frame::MPACK { .. }
+                Frame::PathAck { .. }
         )
     }
 
@@ -1211,7 +1225,7 @@ impl Frame {
                 raw: None,
             },
 
-            Frame::MPACK {
+            Frame::PathAck {
                 path_identifier,
                 ack_delay,
                 ranges,
@@ -1231,7 +1245,7 @@ impl Frame {
                     None => (None, None, None),
                 };
 
-                QuicFrame::MpAck {
+                QuicFrame::PathAck {
                     path_identifier: *path_identifier,
                     ack_delay: Some(*ack_delay as f32 / 1000.0),
                     acked_ranges: Some(ack_ranges),
@@ -1244,14 +1258,12 @@ impl Frame {
             Frame::PathAbandon {
                 path_id,
                 error_code,
-                reason,
             } => QuicFrame::PathAbandon {
                 path_id: *path_id,
                 error_code: *error_code,
-                reason: Some(String::from_utf8_lossy(reason).into_owned()),
             },
 
-            Frame::PathStandby { path_id, seq_num } => QuicFrame::PathStandby {
+            Frame::PathBackup { path_id, seq_num } => QuicFrame::PathBackup {
                 path_id: *path_id,
                 seq_num: *seq_num,
             },
@@ -1262,13 +1274,13 @@ impl Frame {
                     seq_num: *seq_num,
                 },
 
-            Frame::MpNewConnectionId {
+            Frame::PathNewConnectionId {
                 path_id,
                 seq_num,
                 retire_prior_to,
                 conn_id,
                 reset_token,
-            } => QuicFrame::MpNewConnectionId {
+            } => QuicFrame::PathNewConnectionId {
                 path_id: *path_id,
                 sequence_number: *seq_num,
                 retire_prior_to: *retire_prior_to,
@@ -1279,13 +1291,17 @@ impl Frame {
                 )),
             },
 
-            Frame::MpRetireConnectionId { path_id, seq_num } =>
-                QuicFrame::MpRetireConnectionId {
+            Frame::PathRetireConnectionId { path_id, seq_num } =>
+                QuicFrame::PathRetireConnectionId {
                     path_id: *path_id,
                     sequence_number: *seq_num,
                 },
 
             Frame::MaxPathId { max_path_id } => QuicFrame::MaxPathId {
+                max_path_id: *max_path_id,
+            },
+
+            Frame::PathsBlocked { max_path_id } => QuicFrame::PathsBlocked {
                 max_path_id: *max_path_id,
             },
         }
@@ -1456,7 +1472,7 @@ impl std::fmt::Debug for Frame {
                 write!(f, "DATAGRAM len={length}")?;
             },
 
-            Frame::MPACK {
+            Frame::PathAck {
                 path_identifier,
                 ack_delay,
                 ranges,
@@ -1465,27 +1481,19 @@ impl std::fmt::Debug for Frame {
             } => {
                 write!(
                     f,
-                    "MP_ACK path_id={path_identifier} delay={ack_delay} blocks={ranges:?} ecn_counts={ecn_counts:?}",
+                    "PATH_ACK path_id={path_identifier} delay={ack_delay} blocks={ranges:?} ecn_counts={ecn_counts:?}",
                 )?;
             },
 
             Frame::PathAbandon {
                 path_id,
                 error_code,
-                reason,
-                ..
             } => {
-                write!(
-                    f,
-                    "PATH_ABANDON path_id={path_id:x} err={error_code:x} reason={reason:x?}",
-                )?;
+                write!(f, "PATH_ABANDON path_id={path_id:x} err={error_code:x}",)?;
             },
 
-            Frame::PathStandby { path_id, seq_num } => {
-                write!(
-                    f,
-                    "PATH_STANDBY path_id={path_id:x} seq_num={seq_num:x}",
-                )?;
+            Frame::PathBackup { path_id, seq_num } => {
+                write!(f, "PATH_BACKUP path_id={path_id:x} seq_num={seq_num:x}",)?;
             },
 
             Frame::PathAvailable { path_id, seq_num } => {
@@ -1495,7 +1503,7 @@ impl std::fmt::Debug for Frame {
                 )?;
             },
 
-            Frame::MpNewConnectionId {
+            Frame::PathNewConnectionId {
                 path_id,
                 seq_num,
                 retire_prior_to,
@@ -1504,19 +1512,23 @@ impl std::fmt::Debug for Frame {
             } => {
                 write!(
                     f,
-                    "MP_NEW_CONNECTION_ID path_id={path_id} seq_num={seq_num} retire_prior_to={retire_prior_to} conn_id={conn_id:02x?} reset_token={reset_token:02x?}",
+                    "PATH_NEW_CONNECTION_ID path_id={path_id} seq_num={seq_num} retire_prior_to={retire_prior_to} conn_id={conn_id:02x?} reset_token={reset_token:02x?}",
                 )?;
             },
 
-            Frame::MpRetireConnectionId { path_id, seq_num } => {
+            Frame::PathRetireConnectionId { path_id, seq_num } => {
                 write!(
                     f,
-                    "MP_RETIRE_CONNECTION_ID path_id={path_id} seq_num={seq_num}"
+                    "PATH_RETIRE_CONNECTION_ID path_id={path_id} seq_num={seq_num}"
                 )?;
             },
 
             Frame::MaxPathId { max_path_id } => {
                 write!(f, "MAX_PATH_ID max_path_id={max_path_id}")?;
+            },
+
+            Frame::PathsBlocked { max_path_id } => {
+                write!(f, "PATHS_BLOCKED max_path_id={max_path_id}")?;
             },
         }
 
@@ -1588,12 +1600,12 @@ fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     })
 }
 
-fn parse_mp_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
+fn parse_path_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     let path_identifier = b.get_varint()?;
     let (ack_delay, ranges, ecn_counts) =
         parse_common_ack_frame(b, ty & 0x01 != 0)?;
 
-    Ok(Frame::MPACK {
+    Ok(Frame::PathAck {
         path_identifier,
         ack_delay,
         ranges,
@@ -2535,7 +2547,6 @@ mod tests {
         let frame = Frame::PathAbandon {
             path_id: 421_124,
             error_code: 0xbeef,
-            reason: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         };
 
         let wire_len = {
@@ -2543,7 +2554,7 @@ mod tests {
             frame.to_bytes(&mut b).unwrap()
         };
 
-        assert_eq!(wire_len, 25);
+        assert_eq!(wire_len, 12);
 
         let mut b = octets::Octets::with_slice(&mut d);
         assert_eq!(
@@ -2562,7 +2573,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_mp() {
+    fn path_ack() {
         let mut d = [42; 128];
 
         let mut ranges = ranges::RangeSet::default();
@@ -2571,7 +2582,7 @@ mod tests {
         ranges.insert(15..19);
         ranges.insert(3000..5000);
 
-        let frame = Frame::MPACK {
+        let frame = Frame::PathAck {
             path_identifier: 894_994,
             ack_delay: 874_656_534,
             ranges,
@@ -2599,7 +2610,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_mp_ecn() {
+    fn path_ack_ecn() {
         let mut d = [42; 128];
 
         let mut ranges = ranges::RangeSet::default();
@@ -2614,7 +2625,7 @@ mod tests {
             ecn_ce_count: 300,
         });
 
-        let frame = Frame::MPACK {
+        let frame = Frame::PathAck {
             path_identifier: 894_994,
             ack_delay: 874_656_534,
             ranges,
@@ -2642,13 +2653,13 @@ mod tests {
     }
 
     #[test]
-    fn path_standby() {
+    fn path_backup() {
         let mut d = [42; 128];
 
         let path_id = 0xabcdef00;
         let seq_num = 0x42;
 
-        let frame = Frame::PathStandby { path_id, seq_num };
+        let frame = Frame::PathBackup { path_id, seq_num };
 
         let wire_len = {
             let mut b = octets::OctetsMut::with_slice(&mut d);
@@ -2702,10 +2713,10 @@ mod tests {
     }
 
     #[test]
-    fn mp_new_connection_id_frame() {
+    fn path_new_connection_id_frame() {
         let mut d = [42; 128];
 
-        let frame = Frame::MpNewConnectionId {
+        let frame = Frame::PathNewConnectionId {
             path_id: 456_789,
             seq_num: 123_213,
             retire_prior_to: 122_211,
@@ -2734,10 +2745,10 @@ mod tests {
     }
 
     #[test]
-    fn mp_retire_connection_id_frame() {
+    fn path_retire_connection_id_frame() {
         let mut d = [42; 128];
 
-        let frame = Frame::MpRetireConnectionId {
+        let frame = Frame::PathRetireConnectionId {
             path_id: 456_789,
             seq_num: 123_213,
         };
@@ -2767,6 +2778,32 @@ mod tests {
         let mut d = [42; 128];
 
         let frame = Frame::MaxPathId { max_path_id: 42 };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 5);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_err());
+    }
+
+    #[test]
+    fn paths_blocked_frame() {
+        let mut d = [42; 128];
+
+        let frame = Frame::PathsBlocked { max_path_id: 42 };
 
         let wire_len = {
             let mut b = octets::OctetsMut::with_slice(&mut d);
