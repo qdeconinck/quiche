@@ -594,6 +594,9 @@ pub enum Error {
 
     /// No spare Path Identifier to perform the operation in multipath.
     OutOfPathId,
+
+    /// There is no more path available on the connection.
+    NoMorePath,
 }
 
 /// QUIC error codes sent on the wire.
@@ -708,6 +711,7 @@ impl Error {
             Error::UnavailablePath => -21,
             Error::PathIdViolation => -22,
             Error::OutOfPathId => -23,
+            Error::NoMorePath => -24,
         }
     }
 }
@@ -6572,8 +6576,11 @@ impl Connection {
     /// If the path specified by the 4-tuple does not exist, returns an
     /// [`Done`].
     ///
+    /// If the path to abandon is the only active one, returns a [`NoMorePath`].
+    ///
     /// [`InvalidState`]: enum.Error.html#InvalidState
     /// [`Done`]: enum.Error.html#Done
+    /// [`NoMorePath`]: enum.Error.html#NoMorePath
     pub fn abandon_path(
         &mut self, local: SocketAddr, peer: SocketAddr, err_code: u64,
     ) -> Result<()> {

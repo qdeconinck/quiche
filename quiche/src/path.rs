@@ -1120,23 +1120,39 @@ impl PathMap {
         self.multipath = v;
     }
 
+    /// Returns the number of active paths.
+    fn count_active_paths(&self) -> usize {
+        self.paths.iter().filter(|p| p.1.active()).count()
+    }
+
     /// Changes the state of the path with the identifier `path_id` according to
     /// the provided `PathRequest`.
     ///
     /// This API is only usable when multipath extensions are enabled.
     /// Otherwise, it raises an [`InvalidState`].
     ///
+    /// In case the request closes the last active path, returns a
+    /// [`NoMorePath`].
+    ///
     /// In case the request is invalid, returns an [`InvalidState`].
     ///
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
+    /// [`NoMorePath`]: enum.Error.html#variant.NoMorePath
     pub fn request(
         &mut self, path_id: usize, request: PathRequest,
     ) -> Result<()> {
         if !self.multipath {
             return Err(Error::InvalidState);
         }
-        let path = self.get_mut(path_id)?;
         let requested_state = request.requested_state();
+        if let PathState::Closing(_) = requested_state {
+            if self.count_active_paths() == 1 &&
+                path_id == self.get_active_path_id()?
+            {
+                return Err(Error::NoMorePath);
+            }
+        }
+        let path = self.get_mut(path_id)?;
         path.set_state(requested_state)?;
         if path.is_closing() {
             self.mark_path_abandon(path_id, true);
