@@ -227,6 +227,10 @@ pub enum Frame {
     PathsBlocked {
         max_path_id: u64,
     },
+
+    PathCidsBlocked {
+        path_id: u64,
+    },
 }
 
 impl Frame {
@@ -427,6 +431,10 @@ impl Frame {
                 max_path_id: b.get_varint()?,
             },
 
+            0x15228c0e => Frame::PathCidsBlocked {
+                path_id: b.get_varint()?,
+            },
+
             _ => return Err(Error::InvalidFrame),
         };
 
@@ -453,6 +461,7 @@ impl Frame {
                 false,
             (packet::Type::ZeroRTT, Frame::MaxPathId { .. }) => false,
             (packet::Type::ZeroRTT, Frame::PathsBlocked { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::PathCidsBlocked { .. }) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -748,6 +757,12 @@ impl Frame {
 
                 b.put_varint(*max_path_id)?;
             },
+
+            Frame::PathCidsBlocked { path_id } => {
+                b.put_varint(0x15228c0e)?;
+
+                b.put_varint(*path_id)?;
+            },
         }
 
         Ok(before - b.cap())
@@ -998,6 +1013,11 @@ impl Frame {
             Frame::PathsBlocked { max_path_id } => {
                 4 + // frame type
                 octets::varint_len(*max_path_id) // path_id
+            },
+
+            Frame::PathCidsBlocked { path_id } => {
+                4 + // frame type
+                octets::varint_len(*path_id) // path_id
             },
         }
     }
@@ -1305,6 +1325,9 @@ impl Frame {
             Frame::PathsBlocked { max_path_id } => QuicFrame::PathsBlocked {
                 max_path_id: *max_path_id,
             },
+
+            Frame::PathCidsBlocked { path_id } =>
+                QuicFrame::PathCidsBlocked { path_id: *path_id },
         }
     }
 }
@@ -1530,6 +1553,10 @@ impl std::fmt::Debug for Frame {
 
             Frame::PathsBlocked { max_path_id } => {
                 write!(f, "PATHS_BLOCKED max_path_id={max_path_id}")?;
+            },
+
+            Frame::PathCidsBlocked { path_id } => {
+                write!(f, "PATH_CIDS_BLOCKED path_id={path_id}")?;
             },
         }
 
@@ -2805,6 +2832,32 @@ mod tests {
         let mut d = [42; 128];
 
         let frame = Frame::PathsBlocked { max_path_id: 42 };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 5);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_err());
+    }
+
+    #[test]
+    fn path_cids_blocked_frame() {
+        let mut d = [42; 128];
+
+        let frame = Frame::PathCidsBlocked { path_id: 42 };
 
         let wire_len = {
             let mut b = octets::OctetsMut::with_slice(&mut d);

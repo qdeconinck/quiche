@@ -566,6 +566,10 @@ pub enum QuicFrame {
         max_path_id: u64,
     },
 
+    PathCidsBlocked {
+        path_id: u64,
+    },
+
     Unknown {
         raw_frame_type: u64,
         frame_type_value: Option<u64>,
