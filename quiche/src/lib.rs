@@ -2784,9 +2784,12 @@ impl Connection {
         let mut aead = match aead {
             Some(v) => v,
 
-            // If we are the server and multipath is enabled, we need to
-            // create a new crypto context for the new Path ID.
-            None if self.is_multipath_enabled() && self.is_server => {
+            // If we are the server and multipath is enabled (but not on the
+            // initial path, as the handshake may not be complete yet), we
+            // need to create a new crypto context for the new Path ID.
+            None if space_id != packet::INITIAL_PACKET_NUMBER_SPACE_ID &&
+                self.is_server =>
+            {
                 self.pkt_num_spaces.crypto.record_new_path_id(space_id)?;
                 if let Some(v) = self
                     .pkt_num_spaces
