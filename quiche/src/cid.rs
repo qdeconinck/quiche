@@ -232,6 +232,9 @@ pub struct PathConnectionIdentifiers {
     /// The path ID space of the connection identifiers.
     path_id: PathId,
 
+    /// The next packet number space to send.
+    next_pkt_num: u64,
+
     /// All the Destination Connection IDs bound to the path provided by our
     /// peer.
     dcids: BoundedNonEmptyVecDeque<ConnectionIdEntry>,
@@ -936,6 +939,22 @@ impl ConnectionIdentifiers {
     ) -> Result<&ConnectionIdEntry> {
         self.get_pcids(path_id)
             .and_then(|pcid| pcid.get_scid(seq_num))
+            .ok_or(Error::InvalidState)
+    }
+
+    /// Gets the next packet number space for a given Path ID.
+    pub fn get_next_pkt_num(&self, path_id: PathId) -> Result<u64> {
+        self.get_pcids(path_id)
+            .map(|pcid| pcid.next_pkt_num)
+            .ok_or(Error::InvalidState)
+    }
+
+    /// Increments the next packet number space for a given Path ID.
+    pub fn increment_next_pkt_num(&mut self, path_id: PathId) -> Result<()> {
+        self.get_pcids_mut(path_id)
+            .map(|pcid| {
+                pcid.next_pkt_num += 1;
+            })
             .ok_or(Error::InvalidState)
     }
 

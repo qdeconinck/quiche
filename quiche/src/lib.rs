@@ -3894,7 +3894,7 @@ impl Connection {
             .spaces
             .get_mut_or_create(epoch, space_id);
 
-        let pn = pkt_space.next_pkt_num;
+        let pn = self.ids.get_next_pkt_num(space_id)?;
         let largest_acked_pkt =
             path.recovery.get_largest_acked_on_epoch(epoch).unwrap_or(0);
         let pn_len = packet::pkt_num_len(pn, largest_acked_pkt);
@@ -5059,8 +5059,7 @@ impl Connection {
             path.recovery.delivery_rate_update_app_limited(true);
         }
 
-        let pkt_space = self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
-        pkt_space.next_pkt_num += 1;
+        self.ids.increment_next_pkt_num(space_id)?;
 
         let handshake_status = recovery::HandshakeStatus {
             has_handshake_keys: self
@@ -10049,11 +10048,7 @@ pub mod testing {
                 .pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Application);
-            let pkt_space = self
-                .client
-                .pkt_num_spaces
-                .spaces
-                .get(packet::Epoch::Application, 0)?;
+            let pn = self.client.ids.get_next_pkt_num(0)?;
 
             let open_next = space
                 .crypto_open
@@ -10073,7 +10068,7 @@ pub mod testing {
 
             space.key_update = Some(packet::KeyUpdate {
                 crypto_open: open_prev.unwrap(),
-                pn_on_update: pkt_space.next_pkt_num,
+                pn_on_update: pn,
                 update_acked: true,
                 timer: time::Instant::now(),
             });
@@ -10174,7 +10169,7 @@ pub mod testing {
         let epoch = pkt_type.to_epoch()?;
 
         let multipath_multiple_spaces = conn.is_multipath_enabled();
-        let pn = conn.pkt_num_spaces.spaces.get(epoch, 0)?.next_pkt_num;
+        let pn = conn.ids.get_next_pkt_num(0)?;
         let pn_len = 4;
 
         let send_path = conn.paths.get_active()?;
@@ -10253,7 +10248,7 @@ pub mod testing {
             aead,
         )?;
 
-        conn.pkt_num_spaces.spaces.get_mut(epoch, 0)?.next_pkt_num += 1;
+        conn.ids.increment_next_pkt_num(0)?;
 
         Ok(written)
     }
@@ -12705,14 +12700,8 @@ mod tests {
 
         // Client acks RESET_STREAM frame.
         let mut ranges = ranges::RangeSet::default();
-        let server_pkt_num = pipe
-            .server
-            .pkt_num_spaces
-            .spaces
-            .get(packet::Epoch::Application, 0)
-            .unwrap()
-            .next_pkt_num;
-        ranges.insert(server_pkt_num - 5..server_pkt_num);
+        let next_server_pkt_num = pipe.server.ids.get_next_pkt_num(0).unwrap();
+        ranges.insert(next_server_pkt_num - 5..next_server_pkt_num);
 
         let frames = [frame::Frame::ACK {
             ack_delay: 15,
@@ -15074,13 +15063,7 @@ mod tests {
         for _ in 0..512 {
             let recv_count = pipe.server.recv_count;
 
-            last_packet_sent = pipe
-                .client
-                .pkt_num_spaces
-                .spaces
-                .get(epoch, 0)
-                .unwrap()
-                .next_pkt_num;
+            last_packet_sent = pipe.client.ids.get_next_pkt_num(0).unwrap();
 
             pipe.send_pkt_to_server(pkt_type, &frames, &mut buf)
                 .unwrap();
@@ -15088,12 +15071,7 @@ mod tests {
             assert_eq!(pipe.server.recv_count, recv_count + 1);
 
             // Skip packet number.
-            pipe.client
-                .pkt_num_spaces
-                .spaces
-                .get_mut(epoch, 0)
-                .unwrap()
-                .next_pkt_num += 1;
+            pipe.client.ids.increment_next_pkt_num(0).unwrap();
         }
 
         assert_eq!(
@@ -18962,8 +18940,7 @@ mod tests {
         let mut pkt_buf = [0u8; 1500];
         let mut b = octets::OctetsMut::with_slice(&mut pkt_buf);
         let epoch = packet::Type::Short.to_epoch().unwrap();
-        let space = pipe.client.pkt_num_spaces.spaces.get_mut(epoch, 0).unwrap();
-        let pn = space.next_pkt_num;
+        let pn = pipe.client.ids.get_next_pkt_num(0).unwrap();
         let pn_len = 4;
 
         let hdr = Header {
@@ -19008,12 +18985,7 @@ mod tests {
             aead,
         )
         .expect("packet encrypt");
-        pipe.client
-            .pkt_num_spaces
-            .spaces
-            .get_mut(packet::Epoch::Application, 0)
-            .unwrap()
-            .next_pkt_num += 1;
+        pipe.client.ids.increment_next_pkt_num(0).unwrap();
 
         pipe.server
             .recv(&mut pkt_buf[..written], RecvInfo {
