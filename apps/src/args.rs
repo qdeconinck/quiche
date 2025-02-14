@@ -201,15 +201,16 @@ impl Args for CommonArgs {
             .parse::<u64>()
             .unwrap();
 
-        let initial_max_path_id = if args.get_str("--initial-max-path-id") != "" {
-            Some(
-                args.get_str("--initial-max-path-id")
-                    .parse::<u64>()
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
+        let initial_max_path_id =
+            if !args.get_str("--initial-max-path-id").is_empty() {
+                Some(
+                    args.get_str("--initial-max-path-id")
+                        .parse::<u64>()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
 
         CommonArgs {
             alpns,
