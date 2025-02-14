@@ -44,6 +44,8 @@ pub(crate) struct PacketKey {
     ctx: EVP_AEAD_CTX,
 
     nonce: Vec<u8>,
+
+    key: Vec<u8>,
 }
 
 impl PacketKey {
@@ -54,7 +56,19 @@ impl PacketKey {
             alg,
             ctx: make_aead_ctx(alg, &key)?,
             nonce: iv,
+            key,
         })
+    }
+
+    pub fn duplicate_initial_state(&self) -> Result<Self> {
+        let dup_key = Self {
+            alg: self.alg,
+            ctx: make_aead_ctx(self.alg, &self.key)?,
+            nonce: self.nonce.clone(),
+            key: self.key.clone(),
+        };
+
+        Ok(dup_key)
     }
 
     pub fn from_secret(aead: Algorithm, secret: &[u8], enc: u32) -> Result<Self> {

@@ -156,6 +156,18 @@ impl Open {
         })
     }
 
+    pub fn duplicate(&self) -> Result<Open> {
+        Ok(Open {
+            alg: self.alg,
+
+            secret: self.secret.clone(),
+
+            header: self.header.clone(),
+
+            packet: self.packet.duplicate_initial_state()?,
+        })
+    }
+
     pub fn from_secret(aead: Algorithm, secret: &[u8]) -> Result<Open> {
         Ok(Open {
             alg: aead,
@@ -237,6 +249,18 @@ impl Seal {
             header: HeaderProtectionKey::new(alg, hp_key)?,
 
             packet: PacketKey::new(alg, key, iv, Self::ENCRYPT)?,
+        })
+    }
+
+    pub fn duplicate(&self) -> Result<Seal> {
+        Ok(Seal {
+            alg: self.alg,
+
+            secret: self.secret.clone(),
+
+            header: self.header.clone(),
+
+            packet: self.packet.duplicate_initial_state()?,
         })
     }
 

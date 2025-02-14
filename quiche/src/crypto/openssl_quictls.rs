@@ -64,6 +64,10 @@ impl PacketKey {
         })
     }
 
+    pub fn duplicate_initial_state(pk: &PacketKey) -> PacketKey {
+        todo!()
+    }
+
     pub fn from_secret(aead: Algorithm, secret: &[u8], enc: u32) -> Result<Self> {
         let key_len = aead.key_len();
         let nonce_len = aead.nonce_len();

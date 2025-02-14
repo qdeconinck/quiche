@@ -2126,11 +2126,13 @@ impl Connection {
             conn.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_open = Some(aead_open);
+                .crypto_os
+                .set_open(0, Some(aead_open));
             conn.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_seal = Some(aead_seal);
+                .crypto_os
+                .set_seal(0, Some(aead_seal));
 
             conn.derived_initial_secrets = true;
         }
@@ -2415,6 +2417,8 @@ impl Connection {
     fn process_undecrypted_0rtt_packets(&mut self) -> Result<()> {
         // Process previously undecryptable 0-RTT packets if the decryption key
         // is now available.
+        // If the crypto space 0 is no more available, we should not raise an
+        // error.
         if self
             .pkt_num_spaces
             .crypto
@@ -2586,11 +2590,13 @@ impl Connection {
             self.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_open = Some(aead_open);
+                .crypto_os
+                .set_open(0, Some(aead_open));
             self.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_seal = Some(aead_seal);
+                .crypto_os
+                .set_seal(0, Some(aead_seal));
 
             self.handshake
                 .use_legacy_codepoint(self.version != PROTOCOL_VERSION_V1);
@@ -2656,11 +2662,13 @@ impl Connection {
             self.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_open = Some(aead_open);
+                .crypto_os
+                .set_open(0, Some(aead_open));
             self.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_seal = Some(aead_seal);
+                .crypto_os
+                .set_seal(0, Some(aead_seal));
 
             return Err(Error::Done);
         }
@@ -2724,17 +2732,36 @@ impl Connection {
             self.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_open = Some(aead_open);
+                .crypto_os
+                .set_open(0, Some(aead_open));
             self.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
-                .crypto_seal = Some(aead_seal);
+                .crypto_os
+                .set_seal(0, Some(aead_seal));
 
             self.derived_initial_secrets = true;
         }
 
         // Select packet number space epoch based on the received packet's type.
         let epoch = hdr.ty.to_epoch()?;
+
+        let space_id = if self.is_multipath_enabled() {
+            if let Some((path_id, ..)) =
+                self.ids.find_scid_path_id_and_seq(&hdr.dcid)
+            {
+                path_id
+            } else {
+                trace!(
+                    "{} ignored unknown Source CID {:?}",
+                    self.trace_id,
+                    hdr.dcid
+                );
+                return Err(Error::Done);
+            }
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
 
         // Select AEAD context used to open incoming packet.
         let aead = if hdr.ty == packet::Type::ZeroRTT {
@@ -2746,12 +2773,33 @@ impl Connection {
                 .as_ref()
         } else {
             // Otherwise use the packet number space's main key.
-            self.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref()
+            self.pkt_num_spaces
+                .crypto
+                .get(epoch)
+                .crypto_os
+                .get_open(space_id)
         };
 
         // Finally, discard packet if no usable key is available.
         let mut aead = match aead {
             Some(v) => v,
+
+            // If we are the server and multipath is enabled, we need to
+            // create a new crypto context for the new Path ID.
+            None if self.is_multipath_enabled() && self.is_server => {
+                self.pkt_num_spaces.crypto.record_new_path_id(space_id)?;
+                if let Some(v) = self
+                    .pkt_num_spaces
+                    .crypto
+                    .get(epoch)
+                    .crypto_os
+                    .get_open(space_id)
+                {
+                    v
+                } else {
+                    return Err(Error::InvalidState);
+                }
+            },
 
             None => {
                 if hdr.ty == packet::Type::ZeroRTT &&
@@ -2786,23 +2834,6 @@ impl Connection {
         packet::decrypt_hdr(&mut b, &mut hdr, aead).map_err(|e| {
             drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
         })?;
-
-        let space_id = if self.is_multipath_enabled() {
-            if let Some((path_id, ..)) =
-                self.ids.find_scid_path_id_and_seq(&hdr.dcid)
-            {
-                path_id
-            } else {
-                trace!(
-                    "{} ignored unknown Source CID {:?}",
-                    self.trace_id,
-                    hdr.dcid
-                );
-                return Err(Error::Done);
-            }
-        } else {
-            packet::INITIAL_PACKET_NUMBER_SPACE_ID
-        };
 
         // This might be a new space identifier yet unseen before. In such case,
         // it should start with 0.
@@ -2860,15 +2891,15 @@ impl Connection {
                     self.pkt_num_spaces
                         .crypto
                         .get(epoch)
-                        .crypto_open
-                        .as_ref()
+                        .crypto_os
+                        .get_open(space_id)
                         .unwrap()
                         .derive_next_packet_key()?,
                     self.pkt_num_spaces
                         .crypto
                         .get(epoch)
-                        .crypto_seal
-                        .as_ref()
+                        .crypto_os
+                        .get_seal(space_id)
                         .unwrap()
                         .derive_next_packet_key()?,
                 ));
@@ -2936,15 +2967,15 @@ impl Connection {
                 .pkt_num_spaces
                 .crypto
                 .get_mut(epoch)
-                .crypto_seal
-                .replace(seal_next);
+                .crypto_os
+                .replace_seal(space_id, seal_next);
 
             let open_prev = self
                 .pkt_num_spaces
                 .crypto
                 .get_mut(epoch)
-                .crypto_open
-                .replace(open_next)
+                .crypto_os
+                .replace_open(space_id, open_next)
                 .unwrap();
 
             let recv_path = self.paths.get_mut(recv_pid)?;
@@ -3901,7 +3932,7 @@ impl Connection {
 
         // The AEAD overhead at the current encryption level.
         let crypto_overhead =
-            crypto_space.crypto_overhead().ok_or(Error::Done)?;
+            crypto_space.crypto_overhead(space_id).ok_or(Error::Done)?;
 
         let dcid = ConnectionId::from_ref(
             self.ids.get_dcid(space_id, dcid_seq)?.cid.as_ref(),
@@ -5020,8 +5051,8 @@ impl Connection {
             }
         });
 
-        let aead = match crypto_space.crypto_seal {
-            Some(ref v) => v,
+        let aead = match crypto_space.crypto_os.get_seal(space_id) {
+            Some(v) => v,
             None => return Err(Error::InvalidState),
         };
 
@@ -5066,7 +5097,7 @@ impl Connection {
                 .pkt_num_spaces
                 .crypto
                 .get(packet::Epoch::Handshake)
-                .has_keys(),
+                .has_keys(space_id),
             peer_verified_address: self.peer_verified_initial_address,
             completed: self.handshake_completed,
         };
@@ -6232,7 +6263,7 @@ impl Connection {
                     self.pkt_num_spaces
                         .crypto
                         .get(packet::Epoch::Application)
-                        .crypto_overhead()?,
+                        .crypto_overhead(0)?,
                 );
                 // ...clamp to what peer can support...
                 max_len = cmp::min(peer_frame_len as usize, max_len);
@@ -7637,7 +7668,7 @@ impl Connection {
                             .pkt_num_spaces
                             .crypto
                             .get(packet::Epoch::Initial)
-                            .has_keys() =>
+                            .has_keys(0) =>
                         return Ok(packet::Type::Initial),
 
                     _ => (),
@@ -7647,11 +7678,19 @@ impl Connection {
             return Ok(packet::Type::from_epoch(epoch));
         }
 
+        let path_id = self.paths.get(send_pid)?.path_id();
         for &epoch in packet::Epoch::epochs(
             packet::Epoch::Initial..=packet::Epoch::Application,
         ) {
             // Only send packets in a space when we have the send keys for it.
-            if self.pkt_num_spaces.crypto.get(epoch).crypto_seal.is_none() {
+            if self
+                .pkt_num_spaces
+                .crypto
+                .get(epoch)
+                .crypto_os
+                .get_seal(path_id)
+                .is_none()
+            {
                 continue;
             }
 
@@ -8443,12 +8482,27 @@ impl Connection {
 
     /// Drops the keys and recovery state for the given epoch.
     fn drop_epoch_state(&mut self, epoch: packet::Epoch, now: time::Instant) {
-        if self.pkt_num_spaces.crypto.get(epoch).crypto_open.is_none() {
+        if self
+            .pkt_num_spaces
+            .crypto
+            .get(epoch)
+            .crypto_os
+            .get_open(0)
+            .is_none()
+        {
             return;
         }
 
-        self.pkt_num_spaces.crypto.get_mut(epoch).crypto_open = None;
-        self.pkt_num_spaces.crypto.get_mut(epoch).crypto_seal = None;
+        self.pkt_num_spaces
+            .crypto
+            .get_mut(epoch)
+            .crypto_os
+            .set_open(0, None);
+        self.pkt_num_spaces
+            .crypto
+            .get_mut(epoch)
+            .crypto_os
+            .set_seal(0, None);
         self.pkt_num_spaces.clear(epoch);
 
         let handshake_status = self.handshake_status();
@@ -8522,7 +8576,7 @@ impl Connection {
                 .pkt_num_spaces
                 .crypto
                 .get(packet::Epoch::Handshake)
-                .has_keys(),
+                .has_keys(0),
 
             peer_verified_address: self.peer_verified_initial_address,
 
@@ -8862,7 +8916,10 @@ impl Connection {
             if !self.ids.has_spare_path_id() {
                 return Err(Error::OutOfPathId);
             }
-            self.ids.lowest_spare_path_id().ok_or(Error::InvalidState)?
+            let pid =
+                self.ids.lowest_spare_path_id().ok_or(Error::InvalidState)?;
+            self.pkt_num_spaces.crypto.record_new_path_id(pid)?;
+            pid
         } else {
             0
         };
@@ -9079,6 +9136,7 @@ fn close_path(
     pkt_num_spaces
         .spaces
         .remove_application_data_space_id(path_id)?;
+    pkt_num_spaces.crypto.remove_path_id(path_id)?;
     Ok(paths.on_path_abandon_acknowledged(path_id, now, trace_id))
 }
 
@@ -10051,20 +10109,20 @@ pub mod testing {
             let pn = self.client.ids.get_next_pkt_num(0)?;
 
             let open_next = space
-                .crypto_open
-                .as_ref()
+                .crypto_os
+                .get_open(0)
                 .unwrap()
                 .derive_next_packet_key()
                 .unwrap();
 
             let seal_next = space
-                .crypto_seal
-                .as_ref()
+                .crypto_os
+                .get_seal(0)
                 .unwrap()
                 .derive_next_packet_key()?;
 
-            let open_prev = space.crypto_open.replace(open_next);
-            space.crypto_seal.replace(seal_next);
+            let open_prev = space.crypto_os.replace_open(0, open_next);
+            space.crypto_os.replace_seal(0, seal_next);
 
             space.key_update = Some(packet::KeyUpdate {
                 crypto_open: open_prev.unwrap(),
@@ -10213,7 +10271,7 @@ pub mod testing {
                 conn.pkt_num_spaces
                     .crypto
                     .get(epoch)
-                    .crypto_overhead()
+                    .crypto_overhead(0)
                     .unwrap();
             b.put_varint(len as u64)?;
         }
@@ -10228,10 +10286,11 @@ pub mod testing {
             frame.to_bytes(&mut b)?;
         }
 
-        let aead = match conn.pkt_num_spaces.crypto.get(epoch).crypto_seal {
-            Some(ref v) => v,
-            None => return Err(Error::InvalidState),
-        };
+        let aead =
+            match conn.pkt_num_spaces.crypto.get(epoch).crypto_os.get_seal(0) {
+                Some(v) => v,
+                None => return Err(Error::InvalidState),
+            };
 
         // We don't support multipath in this method.
         assert!(!multipath_multiple_spaces);
@@ -10266,8 +10325,8 @@ pub mod testing {
             .pkt_num_spaces
             .crypto
             .get(epoch)
-            .crypto_open
-            .as_ref()
+            .crypto_os
+            .get_open(0)
             .unwrap();
 
         let payload_len = b.cap();
@@ -13650,7 +13709,7 @@ mod tests {
         // Use correct payload length when encrypting the packet.
         let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len());
 
-        let aead = crypto.crypto_seal.as_ref().unwrap();
+        let aead = crypto.crypto_os.get_seal(0).unwrap();
 
         let written = packet::encrypt_pkt(
             &mut b,
@@ -18969,8 +19028,8 @@ mod tests {
             .pkt_num_spaces
             .crypto
             .get(epoch)
-            .crypto_seal
-            .as_ref()
+            .crypto_os
+            .get_seal(0)
             .expect("crypto seal");
 
         let path_seq = packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32;

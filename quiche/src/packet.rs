@@ -904,11 +904,100 @@ impl PktNumSpace {
     }
 }
 
+pub struct PktNumSpaceCryptoOSInner {
+    pub crypto_open: Option<crypto::Open>,
+    pub crypto_seal: Option<crypto::Seal>,
+}
+
+impl PktNumSpaceCryptoOSInner {
+    pub fn new() -> PktNumSpaceCryptoOSInner {
+        PktNumSpaceCryptoOSInner {
+            crypto_open: None,
+            crypto_seal: None,
+        }
+    }
+}
+
+pub struct PktNumSpaceCryptoApplication {
+    pub inner: BTreeMap<PathId, PktNumSpaceCryptoOSInner>,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum PktNumSpaceCryptoOS {
+    IH(PktNumSpaceCryptoOSInner),
+    App(PktNumSpaceCryptoApplication),
+}
+
+impl PktNumSpaceCryptoOS {
+    pub fn set_open(&mut self, path_id: PathId, open: Option<crypto::Open>) {
+        match self {
+            Self::IH(i) => i.crypto_open = open,
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_open = open;
+                },
+        }
+    }
+
+    pub fn set_seal(&mut self, path_id: PathId, seal: Option<crypto::Seal>) {
+        match self {
+            Self::IH(i) => i.crypto_seal = seal,
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_seal = seal;
+                },
+        }
+    }
+
+    pub fn replace_open(
+        &mut self, path_id: PathId, open: crypto::Open,
+    ) -> Option<crypto::Open> {
+        match self {
+            Self::IH(i) => i.crypto_open.replace(open),
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_open.replace(open)
+                } else {
+                    None
+                },
+        }
+    }
+
+    pub fn replace_seal(
+        &mut self, path_id: PathId, seal: crypto::Seal,
+    ) -> Option<crypto::Seal> {
+        match self {
+            Self::IH(i) => i.crypto_seal.replace(seal),
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_seal.replace(seal)
+                } else {
+                    None
+                },
+        }
+    }
+
+    pub fn get_open(&self, path_id: PathId) -> Option<&crypto::Open> {
+        match self {
+            Self::IH(i) => i.crypto_open.as_ref(),
+            Self::App(a) =>
+                a.inner.get(&path_id).and_then(|os| os.crypto_open.as_ref()),
+        }
+    }
+
+    pub fn get_seal(&self, path_id: PathId) -> Option<&crypto::Seal> {
+        match self {
+            Self::IH(i) => i.crypto_seal.as_ref(),
+            Self::App(a) =>
+                a.inner.get(&path_id).and_then(|os| os.crypto_seal.as_ref()),
+        }
+    }
+}
+
 pub struct PktNumSpaceCrypto {
     pub key_update: Option<KeyUpdate>,
 
-    pub crypto_open: Option<crypto::Open>,
-    pub crypto_seal: Option<crypto::Seal>,
+    pub crypto_os: PktNumSpaceCryptoOS,
 
     pub crypto_0rtt_open: Option<crypto::Open>,
 
@@ -916,12 +1005,19 @@ pub struct PktNumSpaceCrypto {
 }
 
 impl PktNumSpaceCrypto {
-    pub fn new() -> PktNumSpaceCrypto {
+    pub fn new(is_app: bool) -> PktNumSpaceCrypto {
+        let os = if is_app {
+            PktNumSpaceCryptoOS::App(PktNumSpaceCryptoApplication {
+                inner: BTreeMap::from([(0, PktNumSpaceCryptoOSInner::new())]),
+            })
+        } else {
+            PktNumSpaceCryptoOS::IH(PktNumSpaceCryptoOSInner::new())
+        };
+
         PktNumSpaceCrypto {
             key_update: None,
 
-            crypto_open: None,
-            crypto_seal: None,
+            crypto_os: os,
 
             crypto_0rtt_open: None,
 
@@ -947,16 +1043,31 @@ impl PktNumSpaceCrypto {
         );
     }
 
-    pub fn crypto_overhead(&self) -> Option<usize> {
-        Some(self.crypto_seal.as_ref()?.alg().tag_len())
+    pub fn crypto_overhead(&self, space_id: PathId) -> Option<usize> {
+        match &self.crypto_os {
+            PktNumSpaceCryptoOS::IH(i) =>
+                Some(i.crypto_seal.as_ref()?.alg().tag_len()),
+            PktNumSpaceCryptoOS::App(a) => a
+                .inner
+                .get(&space_id)
+                .and_then(|i| Some(i.crypto_seal.as_ref()?.alg().tag_len())),
+        }
     }
 
     fn ready(&self) -> bool {
         self.crypto_stream.is_flushable()
     }
 
-    pub fn has_keys(&self) -> bool {
-        self.crypto_open.is_some() && self.crypto_seal.is_some()
+    pub fn has_keys(&self, space_id: PathId) -> bool {
+        match &self.crypto_os {
+            PktNumSpaceCryptoOS::IH(i) =>
+                i.crypto_open.is_some() && i.crypto_seal.is_some(),
+            PktNumSpaceCryptoOS::App(a) => a
+                .inner
+                .get(&space_id)
+                .map(|i| i.crypto_open.is_some() && i.crypto_seal.is_some())
+                .unwrap_or(false),
+        }
     }
 }
 
@@ -1051,11 +1162,54 @@ impl PktNumSpaceCryptoMap {
     fn new() -> PktNumSpaceCryptoMap {
         PktNumSpaceCryptoMap {
             inner: [
-                PktNumSpaceCrypto::new(),
-                PktNumSpaceCrypto::new(),
-                PktNumSpaceCrypto::new(),
+                PktNumSpaceCrypto::new(false),
+                PktNumSpaceCrypto::new(false),
+                PktNumSpaceCrypto::new(true),
             ],
         }
+    }
+
+    pub fn record_new_path_id(&mut self, path_id: PathId) -> Result<()> {
+        let app_crypto = &mut self.inner[Epoch::Application];
+        let PktNumSpaceCryptoOS::App(a) = &mut app_crypto.crypto_os else {
+            return Err(Error::InvalidState);
+        };
+        if a.inner.contains_key(&path_id) {
+            return Err(Error::InvalidState);
+        }
+        let Some((_, first_os)) = a.inner.first_key_value() else {
+            return Err(Error::InvalidState);
+        };
+
+        let mut os = PktNumSpaceCryptoOSInner {
+            crypto_open: None,
+            crypto_seal: None,
+        };
+
+        if let Some(co) = &first_os.crypto_open {
+            os.crypto_open = Some(co.duplicate()?);
+        }
+
+        if let Some(cs) = &first_os.crypto_seal {
+            os.crypto_seal = Some(cs.duplicate()?);
+        }
+
+        a.inner.insert(path_id, os);
+        Ok(())
+    }
+
+    pub fn remove_path_id(&mut self, path_id: PathId) -> Result<()> {
+        let app_crypto = &mut self.inner[Epoch::Application];
+        let PktNumSpaceCryptoOS::App(a) = &mut app_crypto.crypto_os else {
+            return Err(Error::InvalidState);
+        };
+        if a.inner.len() <= 1 {
+            return Err(Error::InvalidState);
+        }
+        if a.inner.remove(&path_id).is_none() {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
     }
 
     #[inline]

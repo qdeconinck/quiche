@@ -769,7 +769,7 @@ extern "C" fn set_read_secret(
             return 1;
         }
 
-        space.crypto_open = Some(open);
+        space.crypto_os.set_open(0, Some(open));
     }
 
     1
@@ -823,7 +823,7 @@ extern "C" fn set_write_secret(
             Err(_) => return 0,
         };
 
-        space.crypto_seal = Some(seal);
+        space.crypto_os.set_seal(0, Some(seal));
     }
 
     1
