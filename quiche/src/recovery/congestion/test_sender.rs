@@ -30,6 +30,7 @@ use std::ops::DerefMut;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::path::NetworkPathId;
 use crate::recovery::congestion::Congestion;
 use crate::recovery::rtt::RttStats;
 use crate::recovery::Acked;
@@ -68,6 +69,7 @@ impl TestSender {
         let mut sent = Sent {
             pkt_num: self.next_pkt,
             frames: Default::default(),
+            network_path_id: NetworkPathId(0),
             time_sent: self.time,
             time_acked: None,
             time_lost: None,

@@ -28,7 +28,7 @@ impl Pmtud {
     }
 
     /// Returns enable status for Path MTU Discovery for the connection.
-    pub fn is_enabled(&mut self) -> bool {
+    pub fn is_enabled(&self) -> bool {
         self.enable
     }
 
@@ -51,7 +51,7 @@ impl Pmtud {
     }
 
     /// Returns the next Path MTU Discovery probe size.
-    pub fn get_probe_size(&mut self) -> usize {
+    pub fn get_probe_size(&self) -> usize {
         self.probe
     }
 
@@ -62,7 +62,7 @@ impl Pmtud {
     }
 
     /// Returns the discovered PATH MTU size.
-    pub fn get_current(&mut self) -> usize {
+    pub fn get_current(&self) -> usize {
         self.cur_size
     }
 

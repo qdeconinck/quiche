@@ -44,6 +44,8 @@ pub(crate) struct PacketKey {
     ctx: EVP_AEAD_CTX,
 
     nonce: Vec<u8>,
+
+    key: Vec<u8>,
 }
 
 impl PacketKey {
@@ -54,7 +56,19 @@ impl PacketKey {
             alg,
             ctx: make_aead_ctx(alg, &key)?,
             nonce: iv,
+            key,
         })
+    }
+
+    pub fn duplicate_initial_state(&self) -> Result<Self> {
+        let dup_key = Self {
+            alg: self.alg,
+            ctx: make_aead_ctx(self.alg, &self.key)?,
+            nonce: self.nonce.clone(),
+            key: self.key.clone(),
+        };
+
+        Ok(dup_key)
     }
 
     pub fn from_secret(aead: Algorithm, secret: &[u8], enc: u32) -> Result<Self> {
@@ -75,13 +89,14 @@ impl PacketKey {
         // packet number) to be zero, which would not be the case for packet
         // number spaces after Initial as the same packet number sequence is
         // shared.
-        let _ = pkt_key.seal_with_u64_counter(0, b"", &mut [0_u8; 16], 0, None);
+        let _ =
+            pkt_key.seal_with_u64_counter(0, 0, b"", &mut [0_u8; 16], 0, None);
 
         Ok(pkt_key)
     }
 
     pub fn open_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8],
+        &self, path_seq: u32, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
         let tag_len = self.alg.tag_len();
 
@@ -92,7 +107,7 @@ impl PacketKey {
 
         let max_out_len = out_len;
 
-        let nonce = make_nonce(&self.nonce, counter);
+        let nonce = make_nonce(&self.nonce, path_seq, counter);
 
         let rc = unsafe {
             EVP_AEAD_CTX_open(
@@ -117,8 +132,8 @@ impl PacketKey {
     }
 
     pub fn seal_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
-        extra_in: Option<&[u8]>,
+        &self, path_seq: u32, counter: u64, ad: &[u8], buf: &mut [u8],
+        in_len: usize, extra_in: Option<&[u8]>,
     ) -> Result<usize> {
         let tag_len = self.alg.tag_len();
 
@@ -135,7 +150,7 @@ impl PacketKey {
             return Err(Error::CryptoFail);
         }
 
-        let nonce = make_nonce(&self.nonce, counter);
+        let nonce = make_nonce(&self.nonce, path_seq, counter);
 
         let rc = unsafe {
             EVP_AEAD_CTX_seal_scatter(

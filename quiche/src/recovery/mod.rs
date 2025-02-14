@@ -32,6 +32,7 @@ use std::time::Instant;
 use std::collections::VecDeque;
 
 use crate::packet::Epoch;
+use crate::path::NetworkPathId;
 use crate::ranges::RangeSet;
 use crate::Config;
 use crate::CongestionControlAlgorithm;
@@ -48,7 +49,7 @@ use smallvec::SmallVec;
 
 use self::congestion::pacer;
 use self::congestion::Congestion;
-use self::rtt::RttStats;
+pub use self::rtt::RttStats;
 
 // Loss Recovery
 const INITIAL_PACKET_THRESHOLD: u64 = 3;
@@ -57,7 +58,7 @@ const MAX_PACKET_THRESHOLD: u64 = 20;
 
 const INITIAL_TIME_THRESHOLD: f64 = 9.0 / 8.0;
 
-const GRANULARITY: Duration = Duration::from_millis(1);
+pub const GRANULARITY: Duration = Duration::from_millis(1);
 
 const MAX_PTO_PROBES_COUNT: usize = 2;
 
@@ -106,6 +107,7 @@ struct LossDetectionResult {
     lost_packets: usize,
     lost_bytes: usize,
     pmtud_lost_bytes: usize,
+    network_path_ids: SmallVec<[(NetworkPathId, Duration); 1]>,
 }
 
 impl RecoveryEpoch {
@@ -199,9 +201,11 @@ impl RecoveryEpoch {
 
     fn detect_lost_packets(
         &mut self, loss_delay: Duration, pkt_thresh: u64, now: Instant,
-        trace_id: &str, epoch: Epoch,
+        trace_id: &str, epoch: Epoch, rtt: Duration,
     ) -> LossDetectionResult {
         self.loss_time = None;
+
+        let mut network_path_ids = SmallVec::new();
 
         // Minimum time of kGranularity before packets are deemed lost.
         let loss_delay = cmp::max(loss_delay, GRANULARITY);
@@ -249,6 +253,11 @@ impl RecoveryEpoch {
 
                     self.in_flight_count -= 1;
 
+                    if network_path_ids.contains(&(unacked.network_path_id, rtt))
+                    {
+                        network_path_ids.push((unacked.network_path_id, rtt));
+                    }
+
                     trace!(
                         "{} packet {} lost on epoch {}",
                         trace_id,
@@ -276,6 +285,7 @@ impl RecoveryEpoch {
             lost_packets,
             lost_bytes,
             pmtud_lost_bytes,
+            network_path_ids,
         }
     }
 
@@ -324,8 +334,6 @@ pub struct Recovery {
     loss_timer: LossDetectionTimer,
 
     pto_count: u32,
-
-    rtt_stats: RttStats,
 
     pub lost_spurious_count: usize,
 
@@ -386,8 +394,6 @@ impl Recovery {
             loss_timer: Default::default(),
 
             pto_count: 0,
-
-            rtt_stats: RttStats::new(recovery_config.max_ack_delay),
 
             lost_spurious_count: 0,
 
@@ -465,7 +471,8 @@ impl Recovery {
 
     pub fn on_packet_sent(
         &mut self, mut pkt: Sent, epoch: packet::Epoch,
-        handshake_status: HandshakeStatus, now: Instant, trace_id: &str,
+        handshake_status: HandshakeStatus, now: Instant, rtt_stats: &RttStats,
+        trace_id: &str,
     ) {
         let ack_eliciting = pkt.ack_eliciting;
         let in_flight = pkt.in_flight;
@@ -486,7 +493,7 @@ impl Recovery {
             sent_bytes,
             now,
             &mut pkt,
-            &self.rtt_stats,
+            rtt_stats,
             self.bytes_lost,
             in_flight,
         );
@@ -495,7 +502,7 @@ impl Recovery {
             self.epochs[epoch].in_flight_count += 1;
             self.bytes_in_flight += sent_bytes;
 
-            self.set_loss_detection_timer(handshake_status, now);
+            self.set_loss_detection_timer(handshake_status, now, rtt_stats);
         }
 
         self.bytes_sent += sent_bytes;
@@ -513,7 +520,7 @@ impl Recovery {
     pub fn on_ack_received(
         &mut self, ranges: &ranges::RangeSet, ack_delay: u64,
         epoch: packet::Epoch, handshake_status: HandshakeStatus, now: Instant,
-        trace_id: &str,
+        rtt_stats: &mut RttStats, trace_id: &str,
     ) -> Result<(usize, usize, usize)> {
         let largest_acked = ranges.last().unwrap();
 
@@ -535,7 +542,7 @@ impl Recovery {
             now,
             ranges,
             &mut self.newly_acked,
-            &self.rtt_stats,
+            rtt_stats,
             trace_id,
         );
 
@@ -559,7 +566,7 @@ impl Recovery {
 
         if largest_newly_acked.pkt_num == largest_acked && has_ack_eliciting {
             let latest_rtt = now - largest_newly_acked.time_sent;
-            self.rtt_stats.update_rtt(
+            rtt_stats.update_rtt(
                 latest_rtt,
                 Duration::from_micros(ack_delay),
                 now,
@@ -569,12 +576,12 @@ impl Recovery {
 
         // Detect and mark lost packets without removing them from the sent
         // packets list.
-        let loss = self.detect_lost_packets(epoch, now, trace_id);
+        let loss = self.detect_lost_packets(epoch, now, rtt_stats, trace_id);
 
         self.congestion.on_packets_acked(
             self.bytes_in_flight,
             &mut self.newly_acked,
-            &self.rtt_stats,
+            rtt_stats,
             now,
         );
 
@@ -582,25 +589,24 @@ impl Recovery {
 
         self.pto_count = 0;
 
-        self.set_loss_detection_timer(handshake_status, now);
+        self.set_loss_detection_timer(handshake_status, now, rtt_stats);
 
-        self.epochs[epoch]
-            .drain_acked_and_lost_packets(now - self.rtt_stats.rtt());
+        self.epochs[epoch].drain_acked_and_lost_packets(now - rtt_stats.rtt());
 
         Ok((loss.0, loss.1, acked_bytes))
     }
 
     pub fn on_loss_detection_timeout(
         &mut self, handshake_status: HandshakeStatus, now: Instant,
-        trace_id: &str,
-    ) -> (usize, usize) {
+        reinject_all_on_pto: bool, rtt_stats: &RttStats, trace_id: &str,
+    ) -> (usize, usize, SmallVec<[(NetworkPathId, Duration); 1]>) {
         let (earliest_loss_time, epoch) = self.loss_time_and_space();
 
         if earliest_loss_time.is_some() {
             // Time threshold loss detection.
-            let loss = self.detect_lost_packets(epoch, now, trace_id);
+            let loss = self.detect_lost_packets(epoch, now, rtt_stats, trace_id);
 
-            self.set_loss_detection_timer(handshake_status, now);
+            self.set_loss_detection_timer(handshake_status, now, rtt_stats);
 
             trace!("{} {:?}", trace_id, self);
             return loss;
@@ -609,7 +615,8 @@ impl Recovery {
         let epoch = if self.bytes_in_flight > 0 {
             // Send new data if available, else retransmit old data. If neither
             // is available, send a single PING frame.
-            let (_, e) = self.pto_time_and_space(handshake_status, now);
+            let (_, e) =
+                self.pto_time_and_space(handshake_status, now, rtt_stats);
 
             e
         } else {
@@ -625,10 +632,31 @@ impl Recovery {
 
         self.pto_count += 1;
 
+        let rtt = rtt_stats.rtt();
         let epoch = &mut self.epochs[epoch];
 
         epoch.loss_probes =
             cmp::min(self.pto_count as usize, MAX_PTO_PROBES_COUNT);
+
+        let taken = if reinject_all_on_pto {
+            epoch.sent_packets.len()
+        } else {
+            epoch.loss_probes
+        };
+
+        // Identify which network path(s) were used. Note that we need to
+        // consider all types of packets, as we may have lost a probe.
+        let mut network_path_ids: SmallVec<[(NetworkPathId, Duration); 1]> =
+            SmallVec::new();
+        let unacked_probe_iter = epoch.sent_packets
+            .iter()
+            // Skip packets that have already been acked or lost.
+            .filter(|p| p.time_acked.is_none() && p.time_lost.is_none());
+        for unacked_probe in unacked_probe_iter {
+            if !network_path_ids.contains(&(unacked_probe.network_path_id, rtt)) {
+                network_path_ids.push((unacked_probe.network_path_id, rtt));
+            }
+        }
 
         let unacked_iter = epoch.sent_packets
             .iter_mut()
@@ -637,7 +665,7 @@ impl Recovery {
             .filter(|p| p.has_data && p.time_acked.is_none() && p.time_lost.is_none())
             // Only return as many packets as the number of probe packets that
             // will be sent.
-            .take(epoch.loss_probes);
+            .take(taken);
 
         // Retransmit the frames from the oldest sent packets on PTO. However
         // the packets are not actually declared lost (so there is no effect to
@@ -650,16 +678,16 @@ impl Recovery {
             epoch.lost_frames.extend_from_slice(&unacked.frames);
         }
 
-        self.set_loss_detection_timer(handshake_status, now);
+        self.set_loss_detection_timer(handshake_status, now, rtt_stats);
 
         trace!("{} {:?}", trace_id, self);
 
-        (0, 0)
+        (0, 0, network_path_ids)
     }
 
     pub fn on_pkt_num_space_discarded(
         &mut self, epoch: packet::Epoch, handshake_status: HandshakeStatus,
-        now: Instant,
+        now: Instant, rtt_stats: &RttStats,
     ) {
         let epoch = &mut self.epochs[epoch];
 
@@ -682,14 +710,15 @@ impl Recovery {
         epoch.loss_probes = 0;
         epoch.in_flight_count = 0;
 
-        self.set_loss_detection_timer(handshake_status, now);
+        self.set_loss_detection_timer(handshake_status, now, rtt_stats);
     }
 
     pub fn on_path_change(
-        &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str,
-    ) -> (usize, usize) {
+        &mut self, epoch: packet::Epoch, now: Instant, old_rtt_stats: &RttStats,
+        trace_id: &str,
+    ) -> (usize, usize, SmallVec<[(NetworkPathId, Duration); 1]>) {
         // Time threshold loss detection.
-        self.detect_lost_packets(epoch, now, trace_id)
+        self.detect_lost_packets(epoch, now, old_rtt_stats, trace_id)
     }
 
     pub fn loss_detection_timer(&self) -> Option<Instant> {
@@ -711,20 +740,8 @@ impl Recovery {
             self.congestion.prr.snd_cnt
     }
 
-    pub fn rtt(&self) -> Duration {
-        self.rtt_stats.rtt()
-    }
-
-    pub fn min_rtt(&self) -> Option<Duration> {
-        self.rtt_stats.min_rtt()
-    }
-
-    pub fn rttvar(&self) -> Duration {
-        self.rtt_stats.rttvar
-    }
-
-    pub fn pto(&self) -> Duration {
-        self.rtt() + cmp::max(self.rtt_stats.rttvar * 4, GRANULARITY)
+    pub fn pto_count(&self) -> u32 {
+        self.pto_count
     }
 
     pub fn delivery_rate(&self) -> u64 {
@@ -783,8 +800,9 @@ impl Recovery {
 
     fn pto_time_and_space(
         &self, handshake_status: HandshakeStatus, now: Instant,
+        rtt_stats: &RttStats,
     ) -> (Option<Instant>, packet::Epoch) {
-        let mut duration = self.pto() * 2_u32.pow(self.pto_count);
+        let mut duration = rtt_stats.pto() * 2_u32.pow(self.pto_count);
 
         // Arm PTO from now when there are no inflight packets.
         if self.bytes_in_flight == 0 {
@@ -816,8 +834,7 @@ impl Recovery {
                 }
 
                 // Include max_ack_delay and backoff for Application Data.
-                duration +=
-                    self.rtt_stats.max_ack_delay * 2_u32.pow(self.pto_count);
+                duration += rtt_stats.max_ack_delay * 2_u32.pow(self.pto_count);
             }
 
             let new_time = epoch
@@ -835,6 +852,7 @@ impl Recovery {
 
     fn set_loss_detection_timer(
         &mut self, handshake_status: HandshakeStatus, now: Instant,
+        rtt_stats: &RttStats,
     ) {
         let (earliest_loss_time, _) = self.loss_time_and_space();
 
@@ -850,17 +868,79 @@ impl Recovery {
         }
 
         // PTO timer.
-        if let (Some(timeout), _) = self.pto_time_and_space(handshake_status, now)
+        if let (Some(timeout), _) =
+            self.pto_time_and_space(handshake_status, now, rtt_stats)
         {
             self.loss_timer.update(timeout);
         }
     }
 
-    fn detect_lost_packets(
-        &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str,
+    pub fn mark_all_inflight_as_lost(
+        &mut self, now: Instant, trace_id: &str,
     ) -> (usize, usize) {
-        let loss_delay = cmp::max(self.rtt_stats.latest_rtt, self.rtt())
-            .mul_f64(self.time_thresh);
+        let mut lost_packets = 0;
+        let mut lost_bytes = 0;
+        for &e in packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        ) {
+            let mut epoch_lost_bytes = 0;
+            let mut largest_lost_pkt = None;
+            let epoch = &mut self.epochs[e];
+            for sent in epoch.sent_packets.drain(..) {
+                if sent.time_acked.is_none() {
+                    epoch.lost_frames.extend_from_slice(&sent.frames);
+                    if sent.in_flight {
+                        epoch_lost_bytes += sent.size;
+
+                        epoch.in_flight_count =
+                            epoch.in_flight_count.saturating_sub(1);
+
+                        trace!(
+                            "{} packet {} lost on epoch {}",
+                            trace_id,
+                            sent.pkt_num,
+                            e
+                        );
+
+                        // Frames have already been removed from the packet.
+                        largest_lost_pkt = Some(sent);
+                    }
+
+                    lost_packets += 1;
+                    self.congestion.lost_count += 1;
+                }
+            }
+
+            self.bytes_lost += epoch_lost_bytes as u64;
+            lost_bytes += epoch_lost_bytes;
+
+            if let Some(pkt) = largest_lost_pkt {
+                if !self.congestion.in_congestion_recovery(pkt.time_sent) {
+                    (self.congestion.cc_ops.checkpoint)(&mut self.congestion);
+                }
+
+                (self.congestion.cc_ops.congestion_event)(
+                    &mut self.congestion,
+                    self.bytes_in_flight,
+                    epoch_lost_bytes,
+                    &pkt,
+                    now,
+                );
+
+                self.bytes_in_flight -= epoch_lost_bytes;
+            }
+        }
+
+        (lost_packets, lost_bytes)
+    }
+
+    fn detect_lost_packets(
+        &mut self, epoch: packet::Epoch, now: Instant, rtt_stats: &RttStats,
+        trace_id: &str,
+    ) -> (usize, usize, SmallVec<[(NetworkPathId, Duration); 1]>) {
+        let rtt = rtt_stats.rtt();
+        let loss_delay =
+            cmp::max(rtt_stats.latest_rtt, rtt).mul_f64(self.time_thresh);
 
         let loss = self.epochs[epoch].detect_lost_packets(
             loss_delay,
@@ -868,6 +948,7 @@ impl Recovery {
             now,
             trace_id,
             epoch,
+            rtt,
         );
 
         if let Some(pkt) = loss.largest_lost_pkt {
@@ -888,12 +969,11 @@ impl Recovery {
 
         self.bytes_in_flight -= loss.pmtud_lost_bytes;
 
-        self.epochs[epoch]
-            .drain_acked_and_lost_packets(now - self.rtt_stats.rtt());
+        self.epochs[epoch].drain_acked_and_lost_packets(now - rtt_stats.rtt());
 
         self.congestion.lost_count += loss.lost_packets;
 
-        (loss.lost_packets, loss.lost_bytes)
+        (loss.lost_packets, loss.lost_bytes, loss.network_path_ids)
     }
 
     pub fn update_app_limited(&mut self, v: bool) {
@@ -909,17 +989,13 @@ impl Recovery {
         self.congestion.delivery_rate.update_app_limited(v);
     }
 
-    pub fn update_max_ack_delay(&mut self, max_ack_delay: Duration) {
-        self.rtt_stats.max_ack_delay = max_ack_delay;
-    }
-
     #[cfg(feature = "qlog")]
-    pub fn maybe_qlog(&mut self) -> Option<EventData> {
+    pub fn maybe_qlog(&mut self, rtt_stats: &RttStats) -> Option<EventData> {
         let qlog_metrics = QlogMetrics {
-            min_rtt: *self.rtt_stats.min_rtt,
-            smoothed_rtt: self.rtt(),
-            latest_rtt: self.rtt_stats.latest_rtt,
-            rttvar: self.rtt_stats.rttvar,
+            min_rtt: *rtt_stats.min_rtt,
+            smoothed_rtt: rtt_stats.rtt(),
+            latest_rtt: rtt_stats.latest_rtt,
+            rttvar: rtt_stats.rttvar,
             cwnd: self.cwnd() as u64,
             bytes_in_flight: self.bytes_in_flight as u64,
             ssthresh: self.congestion.ssthresh as u64,
@@ -935,6 +1011,15 @@ impl Recovery {
 
     pub fn lost_count(&self) -> usize {
         self.congestion.lost_count
+    }
+
+    pub fn lost_spurious_count(&self) -> usize {
+        self.lost_spurious_count
+    }
+
+    #[allow(dead_code)]
+    pub fn bytes_sent(&self) -> usize {
+        self.bytes_sent
     }
 }
 
@@ -957,10 +1042,6 @@ impl std::fmt::Debug for Recovery {
             },
         };
 
-        write!(f, "latest_rtt={:?} ", self.rtt_stats.latest_rtt)?;
-        write!(f, "srtt={:?} ", self.rtt_stats.smoothed_rtt)?;
-        write!(f, "min_rtt={:?} ", *self.rtt_stats.min_rtt)?;
-        write!(f, "rttvar={:?} ", self.rtt_stats.rttvar)?;
         write!(f, "cwnd={} ", self.cwnd())?;
         write!(f, "ssthresh={} ", self.congestion.ssthresh)?;
         write!(f, "bytes_in_flight={} ", self.bytes_in_flight)?;
@@ -989,6 +1070,8 @@ pub struct Sent {
     pub pkt_num: u64,
 
     pub frames: SmallVec<[frame::Frame; 1]>,
+
+    pub network_path_id: NetworkPathId,
 
     pub time_sent: Instant,
 
@@ -1031,7 +1114,9 @@ impl std::fmt::Debug for Sent {
         write!(f, "tx_in_flight={} ", self.tx_in_flight)?;
         write!(f, "lost={} ", self.lost)?;
         write!(f, "has_data={} ", self.has_data)?;
-        write!(f, "pmtud={}", self.pmtud)?;
+        write!(f, "pmtud={} ", self.pmtud)?;
+        write!(f, "time_acked={:?} ", self.time_acked)?;
+        write!(f, "time_lost={:?} ", self.time_lost)?;
 
         Ok(())
     }
@@ -1215,8 +1300,10 @@ mod tests {
     fn loss_on_pto() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(CongestionControlAlgorithm::Reno);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let mut now = Instant::now();
 
@@ -1226,6 +1313,7 @@ mod tests {
         let p = Sent {
             pkt_num: 0,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1247,6 +1335,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -1256,6 +1345,7 @@ mod tests {
         let p = Sent {
             pkt_num: 1,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1277,6 +1367,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -1286,6 +1377,7 @@ mod tests {
         let p = Sent {
             pkt_num: 2,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1307,6 +1399,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 3);
@@ -1315,6 +1408,7 @@ mod tests {
         let p = Sent {
             pkt_num: 3,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1336,6 +1430,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 4);
@@ -1355,6 +1450,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((0, 0, 2 * 1000))
@@ -1368,7 +1464,13 @@ mod tests {
         now = r.loss_detection_timer().unwrap();
 
         // PTO.
-        r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
+        r.on_loss_detection_timeout(
+            HandshakeStatus::default(),
+            now,
+            false,
+            &rtt_stats,
+            "",
+        );
         assert_eq!(r.epochs[packet::Epoch::Application].loss_probes, 1);
         assert_eq!(r.congestion.lost_count, 0);
         assert_eq!(r.pto_count, 1);
@@ -1376,6 +1478,7 @@ mod tests {
         let p = Sent {
             pkt_num: 4,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1397,6 +1500,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 3);
@@ -1405,6 +1509,7 @@ mod tests {
         let p = Sent {
             pkt_num: 5,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1426,6 +1531,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 4);
@@ -1446,6 +1552,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((2, 2000, 2 * 1000))
@@ -1457,9 +1564,9 @@ mod tests {
         assert_eq!(r.congestion.lost_count, 2);
 
         // Wait 1 RTT.
-        now += r.rtt();
+        now += rtt_stats.rtt();
 
-        r.detect_lost_packets(packet::Epoch::Application, now, "");
+        r.detect_lost_packets(packet::Epoch::Application, now, &rtt_stats, "");
 
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 0);
     }
@@ -1468,8 +1575,10 @@ mod tests {
     fn loss_on_timer() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(CongestionControlAlgorithm::Reno);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let mut now = Instant::now();
 
@@ -1479,6 +1588,7 @@ mod tests {
         let p = Sent {
             pkt_num: 0,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1500,6 +1610,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 1);
@@ -1508,6 +1619,7 @@ mod tests {
         let p = Sent {
             pkt_num: 1,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1529,6 +1641,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 2);
@@ -1537,6 +1650,7 @@ mod tests {
         let p = Sent {
             pkt_num: 2,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1558,6 +1672,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 3);
@@ -1566,6 +1681,7 @@ mod tests {
         let p = Sent {
             pkt_num: 3,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1587,6 +1703,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 4);
@@ -1607,6 +1724,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((0, 0, 3 * 1000))
@@ -1620,7 +1738,13 @@ mod tests {
         now = r.loss_detection_timer().unwrap();
 
         // Packet is declared lost.
-        r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
+        r.on_loss_detection_timeout(
+            HandshakeStatus::default(),
+            now,
+            false,
+            &rtt_stats,
+            "",
+        );
         assert_eq!(r.epochs[packet::Epoch::Application].loss_probes, 0);
 
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 2);
@@ -1629,9 +1753,9 @@ mod tests {
         assert_eq!(r.congestion.lost_count, 1);
 
         // Wait 1 RTT.
-        now += r.rtt();
+        now += rtt_stats.rtt();
 
-        r.detect_lost_packets(packet::Epoch::Application, now, "");
+        r.detect_lost_packets(packet::Epoch::Application, now, &rtt_stats, "");
 
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 0);
     }
@@ -1640,8 +1764,10 @@ mod tests {
     fn loss_on_reordering() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(CongestionControlAlgorithm::Reno);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let mut now = Instant::now();
 
@@ -1651,6 +1777,7 @@ mod tests {
         let p = Sent {
             pkt_num: 0,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1672,6 +1799,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 1);
@@ -1680,6 +1808,7 @@ mod tests {
         let p = Sent {
             pkt_num: 1,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1701,6 +1830,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 2);
@@ -1709,6 +1839,7 @@ mod tests {
         let p = Sent {
             pkt_num: 2,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1730,6 +1861,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 3);
@@ -1738,6 +1870,7 @@ mod tests {
         let p = Sent {
             pkt_num: 3,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1759,6 +1892,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 4);
@@ -1778,6 +1912,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((1, 1000, 1000 * 2))
@@ -1797,6 +1932,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((0, 0, 1000))
@@ -1813,9 +1949,9 @@ mod tests {
         assert_eq!(r.pkt_thresh, 4);
 
         // Wait 1 RTT.
-        now += r.rtt();
+        now += rtt_stats.rtt();
 
-        r.detect_lost_packets(packet::Epoch::Application, now, "");
+        r.detect_lost_packets(packet::Epoch::Application, now, &rtt_stats, "");
 
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 0);
     }
@@ -1824,8 +1960,10 @@ mod tests {
     fn pacing() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(CongestionControlAlgorithm::CUBIC);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let mut now = Instant::now();
 
@@ -1835,6 +1973,7 @@ mod tests {
         let p = Sent {
             pkt_num: 0,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1856,6 +1995,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -1879,6 +2019,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((0, 0, 12000))
@@ -1886,7 +2027,7 @@ mod tests {
 
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 0);
         assert_eq!(r.bytes_in_flight, 0);
-        assert_eq!(r.rtt_stats.smoothed_rtt, Duration::from_millis(50));
+        assert_eq!(rtt_stats.smoothed_rtt, Duration::from_millis(50));
 
         // 1 MSS increased.
         assert_eq!(r.cwnd(), 12000 + 1200);
@@ -1895,6 +2036,7 @@ mod tests {
         let p = Sent {
             pkt_num: 1,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1916,6 +2058,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -1929,6 +2072,7 @@ mod tests {
         let p = Sent {
             pkt_num: 2,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1950,6 +2094,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -1960,6 +2105,7 @@ mod tests {
         let p = Sent {
             pkt_num: 3,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1981,6 +2127,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -2003,8 +2150,10 @@ mod tests {
     fn pmtud_loss_on_timer() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(CongestionControlAlgorithm::Reno);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let mut now = Instant::now();
 
@@ -2014,6 +2163,7 @@ mod tests {
         let p = Sent {
             pkt_num: 0,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -2035,6 +2185,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -2045,6 +2196,7 @@ mod tests {
         let p = Sent {
             pkt_num: 1,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -2066,6 +2218,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -2074,6 +2227,7 @@ mod tests {
         let p = Sent {
             pkt_num: 2,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -2095,6 +2249,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -2115,6 +2270,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((0, 0, 2 * 1000))
@@ -2128,7 +2284,13 @@ mod tests {
         now = r.loss_detection_timer().unwrap();
 
         // Packet is declared lost.
-        r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
+        r.on_loss_detection_timeout(
+            HandshakeStatus::default(),
+            now,
+            false,
+            &rtt_stats,
+            "",
+        );
         assert_eq!(r.epochs[packet::Epoch::Application].loss_probes, 0);
 
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 2);
@@ -2139,9 +2301,9 @@ mod tests {
         assert_eq!(r.congestion.lost_count, 0);
 
         // Wait 1 RTT.
-        now += r.rtt();
+        now += rtt_stats.rtt();
 
-        r.detect_lost_packets(packet::Epoch::Application, now, "");
+        r.detect_lost_packets(packet::Epoch::Application, now, &rtt_stats, "");
 
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 0);
         assert_eq!(r.epochs[packet::Epoch::Application].in_flight_count, 0);

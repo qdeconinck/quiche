@@ -35,6 +35,8 @@ octets = { workspace = true }
 quiche = { workspace = true }
 ring = { workspace = true }
 url = { workspace = true }
+slab = "0.4"
+itertools = "0.10"
 
 [lib]
 crate-type = ["lib"]

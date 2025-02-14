@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::ops::Index;
 use std::ops::IndexMut;
@@ -31,6 +32,7 @@ use std::ops::RangeInclusive;
 use std::time;
 
 use crate::Error;
+use crate::PathId;
 use crate::Result;
 
 use crate::crypto;
@@ -106,6 +108,8 @@ where
         self.index_mut(usize::from(index))
     }
 }
+
+pub const INITIAL_PACKET_NUMBER_SPACE_ID: u64 = 0;
 
 /// QUIC packet type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,8 +647,8 @@ pub fn decode_pkt_num(largest_pn: u64, truncated_pn: u64, pn_len: usize) -> u64 
 }
 
 pub fn decrypt_pkt<'a>(
-    b: &'a mut octets::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
-    aead: &crypto::Open,
+    b: &'a mut octets::OctetsMut, path_seq: u32, pn: u64, pn_len: usize,
+    payload_len: usize, aead: &crypto::Open,
 ) -> Result<octets::Octets<'a>> {
     let payload_offset = b.off();
 
@@ -656,8 +660,12 @@ pub fn decrypt_pkt<'a>(
 
     let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
 
-    let payload_len =
-        aead.open_with_u64_counter(pn, header.as_ref(), ciphertext.as_mut())?;
+    let payload_len = aead.open_with_u64_counter(
+        path_seq,
+        pn,
+        header.as_ref(),
+        ciphertext.as_mut(),
+    )?;
 
     Ok(b.get_bytes(payload_len)?)
 }
@@ -688,13 +696,16 @@ pub fn encrypt_hdr(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_pkt(
-    b: &mut octets::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
-    payload_offset: usize, extra_in: Option<&[u8]>, aead: &crypto::Seal,
+    b: &mut octets::OctetsMut, path_seq: u32, pn: u64, pn_len: usize,
+    payload_len: usize, payload_offset: usize, extra_in: Option<&[u8]>,
+    aead: &crypto::Seal,
 ) -> Result<usize> {
     let (mut header, mut payload) = b.split_at(payload_offset)?;
 
     let ciphertext_len = aead.seal_with_u64_counter(
+        path_seq,
         pn,
         header.as_ref(),
         payload.as_mut(),
@@ -826,7 +837,8 @@ fn compute_retry_integrity_tag(
 
     let mut out_tag = vec![0_u8; TAG_LEN];
 
-    let out_len = key.seal_with_u64_counter(0, &pseudo, &mut out_tag, 0, None)?;
+    let out_len =
+        key.seal_with_u64_counter(0, 0, &pseudo, &mut out_tag, 0, None)?;
 
     // Ensure that the output only contains the AEAD tag.
     if out_len != out_tag.len() {
@@ -864,15 +876,6 @@ pub struct PktNumSpace {
     pub recv_pkt_num: PktNumWindow,
 
     pub ack_elicited: bool,
-
-    pub key_update: Option<KeyUpdate>,
-
-    pub crypto_open: Option<crypto::Open>,
-    pub crypto_seal: Option<crypto::Seal>,
-
-    pub crypto_0rtt_open: Option<crypto::Open>,
-
-    pub crypto_stream: stream::Stream,
 }
 
 impl PktNumSpace {
@@ -889,11 +892,132 @@ impl PktNumSpace {
             recv_pkt_num: PktNumWindow::default(),
 
             ack_elicited: false,
+        }
+    }
 
-            key_update: None,
+    fn clear(&mut self) {
+        self.ack_elicited = false;
+    }
 
+    fn ready(&self) -> bool {
+        self.ack_elicited
+    }
+}
+
+pub struct PktNumSpaceCryptoOSInner {
+    pub crypto_open: Option<crypto::Open>,
+    pub crypto_seal: Option<crypto::Seal>,
+}
+
+impl PktNumSpaceCryptoOSInner {
+    pub fn new() -> PktNumSpaceCryptoOSInner {
+        PktNumSpaceCryptoOSInner {
             crypto_open: None,
             crypto_seal: None,
+        }
+    }
+}
+
+pub struct PktNumSpaceCryptoApplication {
+    pub inner: BTreeMap<PathId, PktNumSpaceCryptoOSInner>,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum PktNumSpaceCryptoOS {
+    IH(PktNumSpaceCryptoOSInner),
+    App(PktNumSpaceCryptoApplication),
+}
+
+impl PktNumSpaceCryptoOS {
+    pub fn set_open(&mut self, path_id: PathId, open: Option<crypto::Open>) {
+        match self {
+            Self::IH(i) => i.crypto_open = open,
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_open = open;
+                },
+        }
+    }
+
+    pub fn set_seal(&mut self, path_id: PathId, seal: Option<crypto::Seal>) {
+        match self {
+            Self::IH(i) => i.crypto_seal = seal,
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_seal = seal;
+                },
+        }
+    }
+
+    pub fn replace_open(
+        &mut self, path_id: PathId, open: crypto::Open,
+    ) -> Option<crypto::Open> {
+        match self {
+            Self::IH(i) => i.crypto_open.replace(open),
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_open.replace(open)
+                } else {
+                    None
+                },
+        }
+    }
+
+    pub fn replace_seal(
+        &mut self, path_id: PathId, seal: crypto::Seal,
+    ) -> Option<crypto::Seal> {
+        match self {
+            Self::IH(i) => i.crypto_seal.replace(seal),
+            Self::App(a) =>
+                if let Some(i) = a.inner.get_mut(&path_id) {
+                    i.crypto_seal.replace(seal)
+                } else {
+                    None
+                },
+        }
+    }
+
+    pub fn get_open(&self, path_id: PathId) -> Option<&crypto::Open> {
+        match self {
+            Self::IH(i) => i.crypto_open.as_ref(),
+            Self::App(a) =>
+                a.inner.get(&path_id).and_then(|os| os.crypto_open.as_ref()),
+        }
+    }
+
+    pub fn get_seal(&self, path_id: PathId) -> Option<&crypto::Seal> {
+        match self {
+            Self::IH(i) => i.crypto_seal.as_ref(),
+            Self::App(a) =>
+                a.inner.get(&path_id).and_then(|os| os.crypto_seal.as_ref()),
+        }
+    }
+}
+
+pub struct PktNumSpaceCrypto {
+    pub key_update: Option<KeyUpdate>,
+
+    pub crypto_os: PktNumSpaceCryptoOS,
+
+    pub crypto_0rtt_open: Option<crypto::Open>,
+
+    pub crypto_stream: stream::Stream,
+}
+
+impl PktNumSpaceCrypto {
+    pub fn new(is_app: bool) -> PktNumSpaceCrypto {
+        let os = if is_app {
+            PktNumSpaceCryptoOS::App(PktNumSpaceCryptoApplication {
+                inner: BTreeMap::from([(0, PktNumSpaceCryptoOSInner::new())]),
+            })
+        } else {
+            PktNumSpaceCryptoOS::IH(PktNumSpaceCryptoOSInner::new())
+        };
+
+        PktNumSpaceCrypto {
+            key_update: None,
+
+            crypto_os: os,
 
             crypto_0rtt_open: None,
 
@@ -908,7 +1032,7 @@ impl PktNumSpace {
         }
     }
 
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.crypto_stream = stream::Stream::new(
             0, // dummy
             u64::MAX,
@@ -917,20 +1041,212 @@ impl PktNumSpace {
             true,
             stream::MAX_STREAM_WINDOW,
         );
-
-        self.ack_elicited = false;
     }
 
-    pub fn crypto_overhead(&self) -> Option<usize> {
-        Some(self.crypto_seal.as_ref()?.alg().tag_len())
+    pub fn crypto_overhead(&self, space_id: PathId) -> Option<usize> {
+        match &self.crypto_os {
+            PktNumSpaceCryptoOS::IH(i) =>
+                Some(i.crypto_seal.as_ref()?.alg().tag_len()),
+            PktNumSpaceCryptoOS::App(a) => a
+                .inner
+                .get(&space_id)
+                .and_then(|i| Some(i.crypto_seal.as_ref()?.alg().tag_len())),
+        }
     }
 
-    pub fn ready(&self) -> bool {
-        self.crypto_stream.is_flushable() || self.ack_elicited
+    fn ready(&self) -> bool {
+        self.crypto_stream.is_flushable()
     }
 
-    pub fn has_keys(&self) -> bool {
-        self.crypto_open.is_some() && self.crypto_seal.is_some()
+    pub fn has_keys(&self, space_id: PathId) -> bool {
+        match &self.crypto_os {
+            PktNumSpaceCryptoOS::IH(i) =>
+                i.crypto_open.is_some() && i.crypto_seal.is_some(),
+            PktNumSpaceCryptoOS::App(a) => a
+                .inner
+                .get(&space_id)
+                .map(|i| i.crypto_open.is_some() && i.crypto_seal.is_some())
+                .unwrap_or(false),
+        }
+    }
+}
+
+pub struct PktNumSpaceImplMap {
+    pkt_num_spaces: [PktNumSpace; Epoch::Application as usize],
+    application_pkt_num_spaces: BTreeMap<PathId, PktNumSpace>,
+}
+
+impl PktNumSpaceImplMap {
+    fn new() -> PktNumSpaceImplMap {
+        PktNumSpaceImplMap {
+            pkt_num_spaces: [PktNumSpace::new(), PktNumSpace::new()],
+            application_pkt_num_spaces: BTreeMap::from([(0, PktNumSpace::new())]),
+        }
+    }
+
+    pub fn get(&self, epoch: Epoch, space_id: PathId) -> Result<&PktNumSpace> {
+        match epoch {
+            Epoch::Application => self
+                .application_pkt_num_spaces
+                .get(&space_id)
+                .ok_or(Error::InvalidState),
+            e => Ok(&self.pkt_num_spaces[e]),
+        }
+    }
+
+    pub fn get_mut_or_create(
+        &mut self, epoch: Epoch, space_id: PathId,
+    ) -> &mut PktNumSpace {
+        match epoch {
+            Epoch::Application => self
+                .application_pkt_num_spaces
+                .entry(space_id)
+                .or_insert_with(PktNumSpace::new),
+            e => &mut self.pkt_num_spaces[e],
+        }
+    }
+
+    pub fn get_mut(
+        &mut self, epoch: Epoch, space_id: PathId,
+    ) -> Result<&mut PktNumSpace> {
+        match epoch {
+            Epoch::Application => self
+                .application_pkt_num_spaces
+                .get_mut(&space_id)
+                .ok_or(Error::InvalidState),
+            e => Ok(&mut self.pkt_num_spaces[e]),
+        }
+    }
+
+    fn is_ready(&self, epoch: Epoch, space_id: Option<PathId>) -> bool {
+        match (epoch, space_id) {
+            (Epoch::Application, None) => self
+                .application_pkt_num_spaces
+                .values()
+                .any(|pns| pns.ready()),
+            (e, Some(s)) => match self.get(e, s) {
+                Ok(pns) => pns.ready(),
+                Err(_) => false,
+            },
+            (e, None) => match self.get(e, 0) {
+                Ok(pns) => pns.ready(),
+                Err(_) => false,
+            },
+        }
+    }
+
+    pub fn remove_application_data_space_id(&mut self, id: PathId) -> Result<()> {
+        if !self.application_pkt_num_spaces.contains_key(&id) {
+            warn!("Trying to remove non-present pkt num space with id {}; continuing", id);
+            return Ok(());
+        }
+        if self.application_pkt_num_spaces.len() <= 1 {
+            return Err(Error::OutOfPathId);
+        }
+        self.application_pkt_num_spaces.remove(&id);
+        Ok(())
+    }
+
+    pub fn application_data_space_ids(
+        &self,
+    ) -> impl Iterator<Item = PathId> + '_ {
+        self.application_pkt_num_spaces.keys().copied()
+    }
+}
+
+pub struct PktNumSpaceCryptoMap {
+    inner: [PktNumSpaceCrypto; Epoch::count()],
+}
+
+impl PktNumSpaceCryptoMap {
+    fn new() -> PktNumSpaceCryptoMap {
+        PktNumSpaceCryptoMap {
+            inner: [
+                PktNumSpaceCrypto::new(false),
+                PktNumSpaceCrypto::new(false),
+                PktNumSpaceCrypto::new(true),
+            ],
+        }
+    }
+
+    pub fn record_new_path_id(&mut self, path_id: PathId) -> Result<()> {
+        let app_crypto = &mut self.inner[Epoch::Application];
+        let PktNumSpaceCryptoOS::App(a) = &mut app_crypto.crypto_os else {
+            return Err(Error::InvalidState);
+        };
+        if a.inner.contains_key(&path_id) {
+            return Err(Error::InvalidState);
+        }
+        let Some((_, first_os)) = a.inner.first_key_value() else {
+            return Err(Error::InvalidState);
+        };
+
+        let mut os = PktNumSpaceCryptoOSInner {
+            crypto_open: None,
+            crypto_seal: None,
+        };
+
+        if let Some(co) = &first_os.crypto_open {
+            os.crypto_open = Some(co.duplicate()?);
+        }
+
+        if let Some(cs) = &first_os.crypto_seal {
+            os.crypto_seal = Some(cs.duplicate()?);
+        }
+
+        a.inner.insert(path_id, os);
+        Ok(())
+    }
+
+    pub fn remove_path_id(&mut self, path_id: PathId) -> Result<()> {
+        let app_crypto = &mut self.inner[Epoch::Application];
+        let PktNumSpaceCryptoOS::App(a) = &mut app_crypto.crypto_os else {
+            return Err(Error::InvalidState);
+        };
+        if a.inner.len() <= 1 {
+            return Err(Error::InvalidState);
+        }
+        if a.inner.remove(&path_id).is_none() {
+            warn!("Trying to remove crypto of non-present path with id {}; continuing", path_id);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn get(&self, epoch: Epoch) -> &PktNumSpaceCrypto {
+        &self.inner[epoch]
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, epoch: Epoch) -> &mut PktNumSpaceCrypto {
+        &mut self.inner[epoch]
+    }
+}
+
+pub struct PktNumSpaceMap {
+    pub spaces: PktNumSpaceImplMap,
+    pub crypto: PktNumSpaceCryptoMap,
+}
+
+impl PktNumSpaceMap {
+    pub fn new() -> PktNumSpaceMap {
+        PktNumSpaceMap {
+            spaces: PktNumSpaceImplMap::new(),
+            crypto: PktNumSpaceCryptoMap::new(),
+        }
+    }
+
+    pub fn clear(&mut self, epoch: Epoch) {
+        self.spaces.get_mut(epoch, 0).map(|pns| pns.clear()).ok();
+        self.crypto.get_mut(epoch).clear();
+    }
+
+    /// Returns whether the epoch is ready.
+    /// When specifying the Epoch::Application, if `space_id` is `None`, it will
+    /// consider all the application data packet number spaces; otherwise it
+    /// only consider the specified `space_id`.
+    pub fn is_ready(&self, epoch: Epoch, space_id: Option<u64>) -> bool {
+        self.crypto.get(epoch).ready() || self.spaces.is_ready(epoch, space_id)
     }
 }
 
@@ -1327,7 +1643,8 @@ mod tests {
         assert_eq!(pn, expected_pn);
 
         let payload =
-            decrypt_pkt(&mut b, pn, hdr.pkt_num_len, payload_len, &aead).unwrap();
+            decrypt_pkt(&mut b, 0, pn, hdr.pkt_num_len, payload_len, &aead)
+                .unwrap();
 
         let payload = payload.as_ref();
         assert_eq!(&payload[..expected_frames.len()], expected_frames);
@@ -1545,7 +1862,8 @@ mod tests {
         assert_eq!(pn, 654_360_564);
 
         let payload =
-            decrypt_pkt(&mut b, pn, hdr.pkt_num_len, payload_len, &aead).unwrap();
+            decrypt_pkt(&mut b, 0, pn, hdr.pkt_num_len, payload_len, &aead)
+                .unwrap();
 
         let payload = payload.as_ref();
         assert_eq!(&payload, &[0x01]);
@@ -1581,6 +1899,7 @@ mod tests {
 
         let written = encrypt_pkt(
             &mut b,
+            0,
             pn,
             pn_len,
             payload_len,
@@ -1918,6 +2237,7 @@ mod tests {
 
         let written = encrypt_pkt(
             &mut b,
+            0,
             pn,
             pn_len,
             payload_len,
@@ -1959,7 +2279,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            decrypt_pkt(&mut b, 0, 1, payload_len, &aead),
+            decrypt_pkt(&mut b, 0, 0, 1, payload_len, &aead),
             Err(Error::InvalidPacket)
         );
     }
@@ -1993,7 +2313,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            decrypt_pkt(&mut b, 0, 1, payload_len, &aead),
+            decrypt_pkt(&mut b, 0, 0, 1, payload_len, &aead),
             Err(Error::CryptoFail)
         );
     }

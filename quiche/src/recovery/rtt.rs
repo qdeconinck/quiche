@@ -45,6 +45,8 @@ pub struct RttStats {
     pub(super) max_ack_delay: Duration,
 
     pub(super) first_rtt_sample: Option<Instant>,
+
+    pub(super) rtt_update_count: usize,
 }
 
 impl std::fmt::Debug for RttStats {
@@ -54,6 +56,7 @@ impl std::fmt::Debug for RttStats {
             .field("srtt", &self.smoothed_rtt)
             .field("minrtt", &*self.min_rtt)
             .field("rttvar", &self.rttvar)
+            .field("rtt_update_count", &self.rtt_update_count)
             .finish()
     }
 }
@@ -67,6 +70,7 @@ impl RttStats {
             rttvar: INITIAL_RTT / 2,
             first_rtt_sample: None,
             max_ack_delay,
+            rtt_update_count: 0,
         }
     }
 
@@ -107,6 +111,7 @@ impl RttStats {
             );
 
         self.smoothed_rtt = self.smoothed_rtt * 7 / 8 + adjusted_rtt / 8;
+        self.rtt_update_count += 1;
     }
 
     pub(crate) fn rtt(&self) -> Duration {
@@ -115,5 +120,21 @@ impl RttStats {
 
     pub(crate) fn min_rtt(&self) -> Option<Duration> {
         self.min_rtt.ne(&Duration::ZERO).then_some(*self.min_rtt)
+    }
+
+    pub(crate) fn rttvar(&self) -> Duration {
+        self.rttvar
+    }
+
+    pub(crate) fn rtt_update_count(&self) -> usize {
+        self.rtt_update_count
+    }
+
+    pub(crate) fn pto(&self) -> Duration {
+        self.smoothed_rtt + std::cmp::max(self.rttvar * 4, super::GRANULARITY)
+    }
+
+    pub(crate) fn update_max_ack_delay(&mut self, max_ack_delay: Duration) {
+        self.max_ack_delay = max_ack_delay;
     }
 }

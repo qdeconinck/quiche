@@ -322,10 +322,11 @@ pub fn connect(
         for socket in sockets {
             let local_addr = socket.local_addr().unwrap();
 
-            for peer_addr in conn.paths_iter(local_addr) {
+            for (peer_addr, path_id) in conn.paths_iter(local_addr) {
                 loop {
                     let (write, send_info) = match conn.send_on_path(
                         &mut out,
+                        Some(path_id),
                         Some(local_addr),
                         Some(peer_addr),
                     ) {

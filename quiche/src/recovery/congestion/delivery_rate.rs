@@ -136,8 +136,9 @@ impl Rate {
                 .send_elapsed
                 .max(self.rate_sample.ack_elapsed);
 
-            self.rate_sample.delivered =
-                self.delivered - self.rate_sample.prior_delivered;
+            self.rate_sample.delivered = self
+                .delivered
+                .saturating_sub(self.rate_sample.prior_delivered);
             self.rate_sample.interval = interval;
 
             if interval < min_rtt {
@@ -221,7 +222,10 @@ mod tests {
     #[test]
     fn rate_check() {
         let config = Config::new(0xbabababa).unwrap();
+        let recovery_config = RecoveryConfig::from_config(&config);
+
         let mut r = Recovery::new(&config);
+        let rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let now = Instant::now();
         let mss = r.max_datagram_size();
@@ -231,6 +235,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -252,6 +257,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
         }
@@ -288,7 +294,10 @@ mod tests {
     #[test]
     fn app_limited_cwnd_full() {
         let config = Config::new(0xbabababa).unwrap();
+        let recovery_config = RecoveryConfig::from_config(&config);
+
         let mut r = Recovery::new(&config);
+        let rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let now = Instant::now();
         let mss = r.max_datagram_size();
@@ -298,6 +307,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -319,6 +329,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
         }
@@ -330,7 +341,10 @@ mod tests {
     #[test]
     fn app_limited_check() {
         let config = Config::new(0xbabababa).unwrap();
+        let recovery_config = RecoveryConfig::from_config(&config);
+
         let mut r = Recovery::new(&config);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
 
         let now = Instant::now();
         let mss = r.max_datagram_size();
@@ -340,6 +354,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -361,6 +376,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
         }
@@ -378,6 +394,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             ),
             Ok((0, 0, mss * 5)),

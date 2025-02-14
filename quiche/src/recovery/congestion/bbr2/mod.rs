@@ -688,8 +688,10 @@ mod tests {
     fn bbr2_startup() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(recovery::CongestionControlAlgorithm::BBR2);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
         let now = Instant::now();
         let mss = r.max_datagram_size;
 
@@ -698,6 +700,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -719,6 +722,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
         }
@@ -737,6 +741,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             )
             .is_ok());
@@ -755,8 +760,10 @@ mod tests {
     fn bbr2_congestion_event() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(recovery::CongestionControlAlgorithm::BBR2);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
         let now = Instant::now();
         let mss = r.max_datagram_size;
 
@@ -765,6 +772,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -786,6 +794,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
         }
@@ -805,6 +814,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             )
             .is_ok());
@@ -823,8 +833,10 @@ mod tests {
     fn bbr2_probe_bw() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(recovery::CongestionControlAlgorithm::BBR2);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
         let now = Instant::now();
         let mss = r.max_datagram_size;
 
@@ -835,6 +847,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -856,6 +869,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
 
@@ -875,6 +889,7 @@ mod tests {
                     packet::Epoch::Application,
                     HandshakeStatus::default(),
                     now,
+                    &mut rtt_stats,
                     "",
                 )
                 .is_ok());
@@ -885,6 +900,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -906,6 +922,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
 
@@ -928,6 +945,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             )
             .is_ok());
@@ -941,8 +959,10 @@ mod tests {
     fn bbr2_probe_rtt() {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(recovery::CongestionControlAlgorithm::BBR2);
+        let recovery_config = RecoveryConfig::from_config(&cfg);
 
         let mut r = Recovery::new(&cfg);
+        let mut rtt_stats = RttStats::new(recovery_config.max_ack_delay);
         let now = Instant::now();
         let mss = r.max_datagram_size;
 
@@ -955,6 +975,7 @@ mod tests {
             let pkt = Sent {
                 pkt_num: pn,
                 frames: smallvec![],
+                network_path_id: NetworkPathId(0),
                 time_sent: now,
                 time_acked: None,
                 time_lost: None,
@@ -976,6 +997,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &rtt_stats,
                 "",
             );
 
@@ -994,6 +1016,7 @@ mod tests {
                     packet::Epoch::Application,
                     HandshakeStatus::default(),
                     now,
+                    &mut rtt_stats,
                     "",
                 )
                 .is_ok());
@@ -1011,6 +1034,7 @@ mod tests {
         let pkt = Sent {
             pkt_num: pn,
             frames: smallvec![],
+            network_path_id: NetworkPathId(0),
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -1032,6 +1056,7 @@ mod tests {
             packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
+            &rtt_stats,
             "",
         );
 
@@ -1052,6 +1077,7 @@ mod tests {
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
+                &mut rtt_stats,
                 "",
             )
             .is_ok());

@@ -24,6 +24,13 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::net::SocketAddr;
+use std::str::FromStr;
+
+use itertools::Itertools;
+use quiche::CIDSeq;
+use quiche::PathId;
+
 use super::common::alpns;
 
 pub trait Args {
@@ -54,6 +61,8 @@ pub struct CommonArgs {
     pub qpack_max_table_capacity: Option<u64>,
     pub qpack_blocked_streams: Option<u64>,
     pub initial_cwnd_packets: u64,
+    pub initial_max_path_id: Option<u64>,
+    pub reinject_all_on_pto: bool,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -80,6 +89,9 @@ pub struct CommonArgs {
 /// --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 /// --initial-cwnd-packets      Size of initial congestion window, in packets.
+/// --initial-max-path-id         Enable multipath support up to the number of
+/// paths.
+/// --reinject_all_on_pto       Reinject all data of a path facing PTO.
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -191,6 +203,19 @@ impl Args for CommonArgs {
             .parse::<u64>()
             .unwrap();
 
+        let initial_max_path_id =
+            if !args.get_str("--initial-max-path-id").is_empty() {
+                Some(
+                    args.get_str("--initial-max-path-id")
+                        .parse::<u64>()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+
+        let reinject_all_on_pto = args.get_bool("--reinject-all-on-pto");
+
         CommonArgs {
             alpns,
             max_data,
@@ -214,6 +239,8 @@ impl Args for CommonArgs {
             qpack_max_table_capacity,
             qpack_blocked_streams,
             initial_cwnd_packets,
+            initial_max_path_id,
+            reinject_all_on_pto,
         }
     }
 }
@@ -243,6 +270,8 @@ impl Default for CommonArgs {
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             initial_cwnd_packets: 10,
+            initial_max_path_id: None,
+            reinject_all_on_pto: false,
         }
     }
 }
@@ -280,6 +309,11 @@ Options:
   --max-active-cids NUM    The maximum number of active Connection IDs we can support [default: 2].
   --enable-active-migration   Enable active connection migration.
   --perform-migration      Perform connection migration on another source port.
+  --initial-max-path-id NUM   Enable multipath support up to the number of paths.
+  -A --address ADDR ...    Specify addresses to be used instead of the unspecified address. Non-routable addresses will lead to connectivity issues.
+  -R --rm-addr TIMEADDR ...   Specify addresses to stop using after the provided time (format ms time,addr).
+  -S --status TIMEADDRSTAT ...   Specify availability status to advertise to the peer after the provided time (format ms time,addr,available).
+  -T --retire-dcid TIMEPIDCID ...   Specify CIDs to be retired on a specific path ID (format ms time,path id,CID).
   -H --header HEADER ...   Add a request header.
   -n --requests REQUESTS   Send the given number of identical requests [default: 1].
   --send-priority-update   Send HTTP/3 priority updates if the query string params 'u' or 'i' are present in URLs
@@ -289,6 +323,7 @@ Options:
   --session-file PATH      File used to cache a TLS session for resumption.
   --source-port PORT       Source port to use when connecting to the server [default: 0].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
+  --reinject_all_on_pto       Reinject all data of a path facing PTO.
   -h --help                Show this screen.
 ";
 
@@ -309,6 +344,10 @@ pub struct ClientArgs {
     pub source_port: u16,
     pub perform_migration: bool,
     pub send_priority_update: bool,
+    pub addrs: Vec<SocketAddr>,
+    pub rm_addrs: Vec<(std::time::Duration, SocketAddr)>,
+    pub status: Vec<(std::time::Duration, SocketAddr, bool)>,
+    pub retire_dcids: Vec<(std::time::Duration, PathId, CIDSeq)>,
 }
 
 impl Args for ClientArgs {
@@ -386,6 +425,81 @@ impl Args for ClientArgs {
 
         let send_priority_update = args.get_bool("--send-priority-update");
 
+        let addrs = args
+            .get_vec("--address")
+            .into_iter()
+            .filter_map(|a| a.parse().ok())
+            .collect();
+
+        let rm_addrs = args
+            .get_vec("--rm-addr")
+            .into_iter()
+            .filter_map(|ta| {
+                let s = ta.split(',').collect::<Vec<_>>();
+                if s.len() != 2 {
+                    return None;
+                }
+                let millis = match s[0].parse::<u64>() {
+                    Ok(s) => s,
+                    Err(_) => return None,
+                };
+                let addr = match SocketAddr::from_str(s[1]) {
+                    Ok(a) => a,
+                    Err(_) => return None,
+                };
+                Some((std::time::Duration::from_millis(millis), addr))
+            })
+            .collect();
+
+        let status = args
+            .get_vec("--status")
+            .into_iter()
+            .filter_map(|ta| {
+                let s = ta.split(',').collect::<Vec<_>>();
+                if s.len() != 3 {
+                    return None;
+                }
+                let millis = match s[0].parse::<u64>() {
+                    Ok(s) => s,
+                    Err(_) => return None,
+                };
+                let addr = match SocketAddr::from_str(s[1]) {
+                    Ok(a) => a,
+                    Err(_) => return None,
+                };
+                let status = match s[2].parse::<u64>() {
+                    Ok(0) => false,
+                    Ok(_) => true,
+                    Err(_) => return None,
+                };
+                Some((std::time::Duration::from_millis(millis), addr, status))
+            })
+            .collect();
+
+        let retire_dcids = args
+            .get_vec("--retire-dcid")
+            .into_iter()
+            .filter_map(|ta| {
+                let s = ta.split(',').collect_vec();
+                if s.len() != 3 {
+                    return None;
+                }
+                let millis = match s[0].parse::<u64>() {
+                    Ok(s) => s,
+                    Err(_) => return None,
+                };
+                let path_id = match s[1].parse::<PathId>() {
+                    Ok(p) => p,
+                    Err(_) => return None,
+                };
+                let cid_seq = match s[2].parse::<CIDSeq>() {
+                    Ok(c) => c,
+                    Err(_) => return None,
+                };
+                Some((std::time::Duration::from_millis(millis), path_id, cid_seq))
+            })
+            .collect_vec();
+
         ClientArgs {
             version,
             dump_response_path,
@@ -402,6 +516,10 @@ impl Args for ClientArgs {
             source_port,
             perform_migration,
             send_priority_update,
+            addrs,
+            rm_addrs,
+            status,
+            retire_dcids,
         }
     }
 }
@@ -424,6 +542,10 @@ impl Default for ClientArgs {
             source_port: 0,
             perform_migration: false,
             send_priority_update: false,
+            addrs: vec![],
+            rm_addrs: vec![],
+            status: vec![],
+            retire_dcids: vec![],
         }
     }
 }
@@ -464,6 +586,8 @@ Options:
   --disable-gso               Disable GSO (linux only).
   --disable-pacing            Disable pacing (linux only).
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
+  --initial-max-path-id NUM     Enable multipath support up to the number of paths.
+  --reinject_all_on_pto       Reinject all data of a path facing PTO.
   -h --help                   Show this screen.
 ";
 
