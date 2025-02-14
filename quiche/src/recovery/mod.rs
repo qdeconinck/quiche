@@ -936,6 +936,14 @@ impl Recovery {
     pub fn lost_count(&self) -> usize {
         self.congestion.lost_count
     }
+
+    pub fn lost_spurious_count(&self) -> usize {
+        self.lost_spurious_count
+    }
+
+    pub fn rtt_update_count(&self) -> usize {
+        self.rtt_stats.rtt_update_count
+    }
 }
 
 impl std::fmt::Debug for Recovery {
@@ -1032,6 +1040,8 @@ impl std::fmt::Debug for Sent {
         write!(f, "lost={} ", self.lost)?;
         write!(f, "has_data={} ", self.has_data)?;
         write!(f, "pmtud={}", self.pmtud)?;
+        write!(f, "time_acked={:?} ", self.time_acked)?;
+        write!(f, "time_lost={:?} ", self.time_lost)?;
 
         Ok(())
     }

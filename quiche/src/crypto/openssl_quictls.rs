@@ -78,7 +78,7 @@ impl PacketKey {
     }
 
     pub fn open_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8],
+        &self, path_seq: u32, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
         let tag_len = self.alg.tag_len();
 
@@ -86,7 +86,7 @@ impl PacketKey {
 
         let mut cipher_len = buf.len();
 
-        let nonce = make_nonce(&self.nonce, counter);
+        let nonce = make_nonce(&self.nonce, path_seq, counter);
 
         // Set the IV len.
         const EVP_CTRL_AEAD_SET_IVLEN: i32 = 0x9;
@@ -187,15 +187,15 @@ impl PacketKey {
     }
 
     pub fn seal_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
-        _extra_in: Option<&[u8]>,
+        &self, path_seq: u32, counter: u64, ad: &[u8], buf: &mut [u8],
+        in_len: usize, _extra_in: Option<&[u8]>,
     ) -> Result<usize> {
         let tag_len = self.alg.tag_len();
 
         // TODO: replace this with something more efficient.
         let in_buf = buf.to_owned();
 
-        let nonce = make_nonce(&self.nonce, counter);
+        let nonce = make_nonce(&self.nonce, path_seq, counter);
 
         // Set the IV len.
         const EVP_CTRL_AEAD_SET_IVLEN: i32 = 0x9;
