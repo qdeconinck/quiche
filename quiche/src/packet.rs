@@ -1207,7 +1207,7 @@ impl PktNumSpaceCryptoMap {
             return Err(Error::InvalidState);
         }
         if a.inner.remove(&path_id).is_none() {
-            return Err(Error::InvalidState);
+            warn!("Trying to remove crypto of non-present path with id {}; continuing", path_id);
         }
         Ok(())
     }
