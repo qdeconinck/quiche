@@ -1258,7 +1258,7 @@ impl PathMap {
 
     /// Are all paths in backup state?
     pub fn all_available_paths_backup(&self) -> bool {
-        !self.paths.iter().all(|p| p.1.active() && !p.1.is_backup())
+        !self.paths.iter().filter(|p| p.1.active()).any(|p| !p.1.is_backup())
     }
 
     /// Handles the reception of PATH_BACKUP/PATH_AVAILABLE.
