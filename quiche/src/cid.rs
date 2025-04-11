@@ -321,7 +321,7 @@ impl PathConnectionIdentifiers {
                 initialized_source_connection_id
         );
 
-        let reset_token = initial_scid.as_ref().and(reset_token);
+        let reset_token_scid = initial_scid.as_ref().and(reset_token);
         // We need to track up to (2 * source_conn_id_limit - 1) source
         // Connection IDs when the host wants to force their renewal.
         let scids = BoundedNonEmptyVecDeque::new(
@@ -329,18 +329,18 @@ impl PathConnectionIdentifiers {
             ConnectionIdEntry {
                 cid: initial_scid.unwrap_or_default(),
                 seq: 0,
-                reset_token,
+                reset_token: reset_token_scid,
                 network_path,
             },
         );
 
-        let reset_token = initial_dcid.as_ref().and(reset_token);
+        let reset_token_dcid = initial_dcid.as_ref().and(reset_token);
         let dcids = BoundedNonEmptyVecDeque::new(
             destination_conn_id_limit,
             ConnectionIdEntry {
                 cid: initial_dcid.unwrap_or_default(),
                 seq: 0,
-                reset_token,
+                reset_token: reset_token_dcid,
                 network_path,
             },
         );
