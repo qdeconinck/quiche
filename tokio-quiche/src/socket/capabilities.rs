@@ -287,7 +287,7 @@ impl<'s> SocketCapabilitiesBuilder<'s> {
 /// As a shortcut, you may call `apply_all_and_get_compatibility` to apply the
 /// maxmimum set of capabilities supported by this crate. The result will
 /// indicate which options were actually enabled.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SocketCapabilities {
     /// Indicates if the socket has `UDP_SEGMENT` enabled.
     pub(crate) has_gso: bool,

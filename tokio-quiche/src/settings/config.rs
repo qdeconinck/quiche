@@ -29,6 +29,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::time::Duration;
 
+use crate::quic::scheduler::BoxedScheduler;
 use crate::result::QuicResult;
 use crate::settings::CertificateKind;
 use crate::settings::ConnectionParams;
@@ -48,6 +49,7 @@ pub(crate) struct Config {
     pub handshake_timeout: Option<Duration>,
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
+    pub packet_scheduler: Option<BoxedScheduler>,
 }
 
 impl AsMut<quiche::Config> for Config {
@@ -98,6 +100,7 @@ impl Config {
             handshake_timeout: quic_settings.handshake_timeout,
             has_ippktinfo,
             has_ipv6pktinfo,
+            packet_scheduler: params.packet_scheduler.clone(),
         })
     }
 }
@@ -158,6 +161,10 @@ fn make_quiche_config(
     config.set_cc_algorithm_name(quic_settings.cc_algorithm.as_str())?;
     config.enable_hystart(quic_settings.enable_hystart);
     config.enable_pacing(quic_settings.enable_pacing);
+
+    if let Some(max_path_id) = quic_settings.initial_max_path_id {
+        config.set_initial_max_path_id(max_path_id);
+    }
 
     if should_log_keys {
         config.log_keys();

@@ -144,6 +144,15 @@ impl ConnectionMap {
         }
     }
 
+    pub(crate) fn map_cid_with_id(
+        &mut self, cid: ConnectionId<'_>, id: QuicheId,
+    ) {
+        if let Some(ev_sender) = self.conn_map.get(&id) {
+            self.quic_id_map
+                .insert((&cid).into(), (id, ev_sender.clone()));
+        }
+    }
+
     pub(crate) fn unmap_cid(&mut self, cid: &ConnectionId<'_>) {
         self.quic_id_map.remove(&cid.into());
     }

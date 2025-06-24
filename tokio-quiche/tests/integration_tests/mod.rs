@@ -170,6 +170,7 @@ async fn test_ioworker_state_machine_pause() {
         QuicSettings::default(),
         tls_cert_settings,
         hooks,
+        None,
     );
     let mut stream = listen(
         vec![socket],

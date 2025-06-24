@@ -26,6 +26,7 @@
 
 pub(crate) mod acceptor;
 pub(crate) mod connector;
+pub(crate) mod multipath;
 
 use super::connection::ConnectionMap;
 use super::connection::HandshakeInfo;
@@ -115,6 +116,7 @@ struct PollRecvData {
 pub enum ConnectionMapCommand {
     UnmapCid(ConnectionId<'static>),
     RemoveScid(ConnectionId<'static>),
+    MapCid(ConnectionId<'static>, u64),
 }
 
 /// An `InboundPacketRouter` maintains a map of quic connections and routes
@@ -328,9 +330,10 @@ where
             init_rx_time,
             handshake_info,
             quiche_conn: conn,
-            socket: Arc::clone(&self.socket_tx),
-            local_addr,
+            sockets: vec![Arc::clone(&self.socket_tx)],
+            local_addrs: vec![local_addr],
             peer_addr,
+            packet_scheduler: self.config.packet_scheduler.clone(),
         });
 
         conn.audit_log_stats
@@ -563,6 +566,8 @@ where
                 ConnectionMapCommand::UnmapCid(cid) => self.conns.unmap_cid(&cid),
                 ConnectionMapCommand::RemoveScid(scid) =>
                     self.conns.remove(&scid),
+                ConnectionMapCommand::MapCid(scid, id) =>
+                    self.conns.map_cid_with_id(scid, id),
             }
         }
     }
@@ -659,6 +664,7 @@ where
                         buf,
                         rx_time,
                         gro,
+                        path_id: None,
                     });
 
                     if let Err(e) = res {
@@ -903,6 +909,7 @@ mod tests {
             quic_settings,
             tls_cert_settings,
             Hooks::default(),
+            None,
         );
         let config = Config::new(&params, SocketCapabilities::default()).unwrap();
 

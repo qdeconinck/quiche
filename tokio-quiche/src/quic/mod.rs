@@ -80,6 +80,8 @@
 //! [listen]: crate::listen
 //! [iqc]: crate::InitialQuicConnection
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,6 +93,7 @@ use crate::http3::settings::Http3Settings;
 use crate::metrics::DefaultMetrics;
 use crate::metrics::Metrics;
 use crate::settings::Config;
+use crate::socket::MultiSocket;
 use crate::socket::QuicListener;
 use crate::socket::Socket;
 use crate::socket::SocketCapabilities;
@@ -107,6 +110,7 @@ mod hooks;
 mod io;
 pub mod raw;
 mod router;
+pub mod scheduler;
 
 use self::connection::ApplicationOverQuic;
 use self::connection::ConnectionIdGenerator;
@@ -114,6 +118,7 @@ use self::connection::QuicConnection;
 use self::router::acceptor::ConnectionAcceptor;
 use self::router::acceptor::ConnectionAcceptorConfig;
 use self::router::connector::ClientConnector;
+use self::router::multipath::MultiPathInboundRouter;
 use self::router::InboundPacketRouter;
 
 pub use self::connection::ConnectionShutdownBehaviour;
@@ -131,6 +136,9 @@ pub type QuicheConnection = quiche::Connection<crate::buf_factory::BufFactory>;
 /// Alias of [quiche::Connection] used internally by the crate.
 #[cfg(not(feature = "zero-copy"))]
 pub type QuicheConnection = quiche::Connection;
+
+type BoxRouter =
+    Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'static>>;
 
 fn make_qlog_writer(
     dir: &str, id: &str,
@@ -159,8 +167,8 @@ pub async fn connect<Tx, Rx, S>(
     socket: S, host: Option<&str>,
 ) -> QuicResult<(QuicConnection, ClientH3Controller)>
 where
-    Tx: DatagramSocketSend + Send + 'static,
-    Rx: DatagramSocketRecv + Unpin + 'static,
+    Tx: DatagramSocketSend + Send + Clone + 'static,
+    Rx: DatagramSocketRecv + Clone + Unpin + 'static,
     S: TryInto<Socket<Tx, Rx>>,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
@@ -169,8 +177,21 @@ where
     let mut params = ConnectionParams::default();
     params.settings.max_idle_timeout = Some(Duration::from_secs(30));
 
+    let socket: Socket<Tx, Rx> = match socket.try_into() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(e.into());
+        },
+    };
+    let mutli_socket = match MultiSocket::new(vec![socket]) {
+        Ok(multi_socket) => multi_socket,
+        Err(e) => {
+            return Err(e.into());
+        },
+    };
+
     Ok((
-        connect_with_config(socket, host, &params, h3_driver).await?,
+        connect_with_config(mutli_socket, host, &params, h3_driver).await?,
         h3_controller,
     ))
 }
@@ -187,25 +208,27 @@ where
 /// Sharing a socket among multiple connections will lead to lost packets as
 /// both connections try to read from the shared socket.
 pub async fn connect_with_config<Tx, Rx, S, App>(
-    socket: S, host: Option<&str>, params: &ConnectionParams<'_>, app: App,
+    sockets: S, host: Option<&str>, params: &ConnectionParams<'_>, app: App,
 ) -> QuicResult<QuicConnection>
 where
-    Tx: DatagramSocketSend + Send + 'static,
-    Rx: DatagramSocketRecv + Unpin + 'static,
-    S: TryInto<Socket<Tx, Rx>>,
+    Tx: DatagramSocketSend + Send + Clone + 'static,
+    Rx: DatagramSocketRecv + Clone + Unpin + 'static,
+    S: TryInto<MultiSocket<Tx, Rx>>,
     S::Error: std::error::Error + Send + Sync + 'static,
     App: ApplicationOverQuic,
 {
-    let socket: Socket<Tx, Rx> = socket.try_into()?;
+    let sockets: MultiSocket<Tx, Rx> = sockets.try_into()?;
+    let mut caps = SocketCapabilities::default();
 
     #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
-    let mut caps = SocketCapabilities::default();
-    #[cfg(target_os = "linux")]
-    if let Some(s) = socket.as_udp_socket() {
-        caps = SocketCapabilities::apply_all_and_get_compatibility(
-            s,
-            params.settings.max_send_udp_payload_size,
-        );
+    for socket in sockets.paths.iter() {
+        #[cfg(target_os = "linux")]
+        if let Some(s) = socket.as_udp_socket() {
+            caps = SocketCapabilities::apply_all_and_get_compatibility(
+                s,
+                params.settings.max_send_udp_payload_size,
+            );
+        }
     }
 
     let mut client_config = Config::new(params, caps)?;
@@ -219,6 +242,15 @@ where
         socket.peer_addr,
         client_config.as_mut(),
     )?;
+
+    // TODO: find a way to detect after the connection is established if the
+    // endpoints agreed on a multipath connection. This is needed to determine
+    // if we should use MPQUIC.
+    // For now, we assume they always agree on the same multipath setting.
+    let socket = sockets.primary_path().unwrap_or_else(|| {
+        panic!("no primary path found, this should not happen")
+    });
+    let is_multipath = params.settings.initial_max_path_id.is_some();
 
     #[cfg(not(feature = "zero-copy"))]
     let mut quiche_conn = quiche::connect(
@@ -253,17 +285,43 @@ where
         }
     }
 
-    let socket_tx = Arc::new(socket.send);
-    let socket_rx = socket.recv;
+    // Clone the send/receive parts for each path
+    let sockets_tx = sockets
+        .paths
+        .iter()
+        .map(|socket| Arc::new(socket.send.clone()))
+        .collect::<Vec<_>>();
 
-    let (router, mut quic_connection_stream) = InboundPacketRouter::new(
-        client_config,
-        Arc::clone(&socket_tx),
-        socket_rx,
-        socket.local_addr,
-        ClientConnector::new(socket_tx, quiche_conn),
-        DefaultMetrics,
-    );
+    let sockets_rx = sockets
+        .paths
+        .iter()
+        .map(|socket| (socket.recv.clone(), socket.local_addr))
+        .collect::<Vec<_>>();
+
+    // Use the primary path's send part for the ClientConnector
+    let socket_tx = Arc::new(socket.send.clone());
+    let (router, mut quic_connection_stream): (BoxRouter, _) = if is_multipath {
+        let (r, s) = MultiPathInboundRouter::new(
+            client_config,
+            sockets_tx,
+            sockets_rx,
+            socket.local_addr,
+            ClientConnector::new(socket_tx, quiche_conn),
+            DefaultMetrics,
+        );
+        (Box::pin(r), s)
+    } else {
+        let socket_rx = socket.recv.clone();
+        let (r, s) = InboundPacketRouter::new(
+            client_config,
+            Arc::clone(&socket_tx),
+            socket_rx,
+            socket.local_addr,
+            ClientConnector::new(socket_tx, quiche_conn),
+            DefaultMetrics,
+        );
+        (Box::pin(r), s)
+    };
 
     // drive the packet router:
     tokio::spawn(async move {

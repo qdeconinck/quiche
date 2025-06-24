@@ -170,6 +170,14 @@ pub struct QuicSettings {
     /// Defaults to 1024 connections.
     #[serde(default = "QuicSettings::default_listen_backlog")]
     pub listen_backlog: usize,
+
+    /// Sets the initial maximum path ID.
+    ///
+    /// This parameter is optional. If set even to `0`, it will enable the
+    /// multipath extension.
+    ///
+    /// Defaults to `None`, meaning no multipath support.
+    pub initial_max_path_id: Option<u64>,
 }
 
 impl QuicSettings {

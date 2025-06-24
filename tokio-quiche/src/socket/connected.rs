@@ -36,7 +36,7 @@ use tokio::net::UdpSocket;
 /// [`Socket`] abstracts over both real UDP-based connections and in-process
 /// tunneled flows like (multi-hop) MASQUE flows. It uses the
 /// [`datagram_socket`] traits for this purpose.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Socket<Tx, Rx> {
     /// The sending half of the connection. This generally supports concurrent
     /// senders.

@@ -47,6 +47,7 @@ use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
 use super::io::worker::WriterConfig;
 use super::router::ConnectionMapCommand;
+use super::scheduler::BoxedScheduler;
 use crate::metrics::Metrics;
 use crate::quic::HandshakeInfo;
 use crate::quic::Incoming;
@@ -88,18 +89,28 @@ where
 /// [`quiche::Connection`]. To start handshaking and consuming packets from the
 /// returned channel, use the methods on [`InitialQuicConnection`].
 pub fn wrap_quiche_conn<Tx, R, M>(
-    quiche_conn: QuicheConnection, tx_socket: Socket<Arc<Tx>, R>, metrics: M,
+    quiche_conn: QuicheConnection, tx_socket: Vec<Socket<Arc<Tx>, R>>,
+    metrics: M, packet_scheduler: Option<BoxedScheduler>,
 ) -> ConnWrapperResult<Tx, M>
 where
     Tx: DatagramSocketSend + Send + 'static + ?Sized,
     M: Metrics,
 {
-    let Socket {
-        send: socket,
-        local_addr,
-        peer_addr,
-        ..
-    } = tx_socket;
+    let mut sockets = vec![];
+    let mut local_addrs = vec![];
+    let peer_addr = tx_socket
+        .iter()
+        .map(|s: &Socket<Arc<Tx>, R>| s.peer_addr)
+        .next()
+        .expect("no socket provided");
+    for socket in &tx_socket {
+        let Socket {
+            send, local_addr, ..
+        } = socket;
+        sockets.push(send.clone());
+        local_addrs.push(*local_addr);
+    }
+    // let sockets = tx_socket.into_iter().map(|s| s.send).collect::<Vec<_>>();
     let (shutdown_tx, worker_shutdown_rx) = mpsc::channel(1);
     let (conn_map_cmd_tx, conn_map_rx) = mpsc::unbounded_channel();
 
@@ -125,9 +136,10 @@ where
         init_rx_time: None,
         handshake_info: HandshakeInfo::new(Instant::now(), None),
         quiche_conn,
-        socket,
-        local_addr,
+        sockets,
+        local_addrs,
         peer_addr,
+        packet_scheduler,
     };
 
     let conn = InitialQuicConnection::new(conn_params);

@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ use crate::quic::connection::HandshakeError;
 use crate::quic::connection::Incoming;
 use crate::quic::connection::QuicConnectionStats;
 use crate::quic::router::ConnectionMapCommand;
+use crate::quic::scheduler::BoxedScheduler;
 use crate::quic::QuicheConnection;
 use crate::QuicResult;
 
@@ -77,31 +79,48 @@ const RELEASE_TIMER_THRESHOLD: Duration = Duration::from_micros(250);
 const GSO_THRESHOLD: usize = 1_000;
 
 pub struct WriterConfig {
+    /// Connection ID used during the handshake
     pub pending_cid: Option<ConnectionId<'static>>,
+    /// Peer address used during the handshake
     pub peer_addr: SocketAddr,
+    /// Whether to use GSO
     pub with_gso: bool,
+    /// Whether to use GSO with pacing
     pub pacing_offload: bool,
+    /// Whether there are packet info
     pub with_pktinfo: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct WriteState {
+    /// Whether the connection has completed handshaking
     conn_established: bool,
+    /// Number of bytes written for this path
     bytes_written: usize,
+    /// Size of the segment written to the socket
     segment_size: usize,
+    /// Number of packets prepared for this path
     num_pkts: usize,
+    /// Scheduled transmit time for pacings
     tx_time: Option<Instant>,
+    /// Whether there are pending data to send on any path
     has_pending_data: bool,
     // If pacer schedules packets too far into the future, we want to pause
     // sending, until the future arrives
     next_release_time: Option<Instant>,
     // If set, outgoing packets will be sent to the peer from the `send_from`
     // address rather than the listening socket.
+    /// Socket address used as the source for outgoing packets
     send_from: Option<SocketAddr>,
+    /// Socket address used as the destination for outgoing packets
+    send_to: Option<SocketAddr>,
+    /// Path identifier
+    network_path_id: Option<usize>,
 }
 
 pub(crate) struct IoWorkerParams<Tx, M> {
-    pub(crate) socket: MaybeConnectedSocket<Tx>,
+    pub(crate) id: u64,
+    pub(crate) sockets: Vec<MaybeConnectedSocket<Tx>>,
     pub(crate) shutdown_tx: mpsc::Sender<()>,
     pub(crate) cfg: WriterConfig,
     pub(crate) audit_log_stats: Arc<QuicAuditStats>,
@@ -110,10 +129,12 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub(crate) init_rx_time: Option<SystemTime>,
     pub(crate) metrics: M,
+    pub(crate) packet_scheduler: Option<BoxedScheduler>,
 }
 
 pub(crate) struct IoWorker<Tx, M, S> {
-    socket: MaybeConnectedSocket<Tx>,
+    id: u64,
+    sockets: Vec<MaybeConnectedSocket<Tx>>,
     /// A field that signals to the listener task that the connection has gone
     /// away (nothing is sent here, listener task just detects the sender
     /// has dropped)
@@ -127,6 +148,8 @@ pub(crate) struct IoWorker<Tx, M, S> {
     metrics: M,
     conn_stage: S,
     bw_estimator: BandwidthReporter,
+    packet_scheduler: Option<BoxedScheduler>,
+    known_cids: HashSet<ConnectionId<'static>>,
 }
 
 impl<Tx, M, S> IoWorker<Tx, M, S>
@@ -142,7 +165,8 @@ where
         log::trace!("Creating IoWorker with stage: {conn_stage:?}");
 
         Self {
-            socket: params.socket,
+            id: params.id,
+            sockets: params.sockets,
             shutdown_tx: params.shutdown_tx,
             cfg: params.cfg,
             audit_log_stats: params.audit_log_stats,
@@ -153,6 +177,8 @@ where
             metrics: params.metrics,
             conn_stage,
             bw_estimator,
+            packet_scheduler: params.packet_scheduler,
+            known_cids: HashSet::new(),
         }
     }
 
@@ -188,6 +214,8 @@ where
                 }
 
                 self.conn_stage.on_read(did_recv, qconn, ctx)?;
+                self.process_path_events(qconn)?;
+                self.sync_connection_ids(qconn)?;
 
                 let can_release = match self.write_state.next_release_time {
                     None => true,
@@ -442,14 +470,85 @@ where
             send_buf = &mut send_buf[..segment_size.unwrap_or(usize::MAX)];
         }
 
+        let multipath_enabled = qconn.is_multipath_enabled() &&
+            qconn.is_established() &&
+            qconn.is_handshake_confirmed();
+
+        if multipath_enabled {
+            if let Some(scheduler) = &mut self.packet_scheduler {
+                if let Some((local_addr, peer_addr)) = scheduler.next_path(qconn)
+                {
+                    match qconn.send_on_path(
+                        send_buf,
+                        None,
+                        Some(local_addr),
+                        Some(peer_addr),
+                    ) {
+                        Ok((packet_size, info)) => {
+                            let _ = send_info.get_or_insert(info);
+                            let send_from =
+                                send_info.as_ref().map(|info| info.from);
+                            let send_to = send_info.as_ref().map(|info| info.to);
+
+                            self.write_state.bytes_written += packet_size;
+                            self.write_state.num_pkts += 1;
+                            self.write_state.send_from = send_from;
+                            self.write_state.send_to = send_to;
+                            let network_path_id = qconn
+                                .network_path_id_from(
+                                    send_from.unwrap(),
+                                    send_to.unwrap(),
+                                )
+                                .map(|id| id as usize); // TODO: check the Option
+                            self.write_state.network_path_id = network_path_id;
+
+                            return Ok(packet_size);
+                        },
+                        Err(QuicheError::Done) => {
+                            // Flush to network and yield when there are no
+                            // more packets to write.
+                            return Ok(0);
+                        },
+                        Err(e) => {
+                            let error_code = if let Some(local_error) =
+                                qconn.local_error()
+                            {
+                                local_error.error_code
+                            } else {
+                                let internal_error_code =
+                                    quiche::WireErrorCode::InternalError as u64;
+                                let _ =
+                                    qconn.close(false, internal_error_code, &[]);
+
+                                internal_error_code
+                            };
+
+                            self.audit_log_stats
+                                .set_sent_conn_close_transport_error_code(
+                                    error_code as i64,
+                                );
+
+                            return Err(Box::new(e));
+                        },
+                    }
+                }
+            }
+        }
+
         match qconn.send(send_buf) {
             Ok((packet_size, info)) => {
                 let _ = send_info.get_or_insert(info);
+                let send_from = send_info.as_ref().map(|info| info.from);
+                let send_to = send_info.as_ref().map(|info| info.to);
 
                 self.write_state.bytes_written += packet_size;
                 self.write_state.num_pkts += 1;
-                self.write_state.send_from =
-                    send_info.as_ref().map(|info| info.from);
+                self.write_state.send_from = send_from;
+                self.write_state.send_to = send_to;
+                let network_path_id = qconn
+                    .network_path_id_from(send_from.unwrap(), send_to.unwrap())
+                    .map(|id| id as usize); // TODO: check the Option
+                self.write_state.network_path_id = network_path_id;
 
                 Ok(packet_size)
             },
@@ -459,30 +558,18 @@ where
                 Ok(0)
             },
             Err(e) => {
-                if let Some(local_error) = qconn.local_error() {
-                    self.audit_log_stats
-                        .set_sent_conn_close_transport_error_code(
-                            local_error.error_code as i64,
-                        );
-                    log::error!(
-                        "quiche::send failed and connection closed with error_code: {}",
-                        local_error.error_code
-                    );
+                let error_code = if let Some(local_error) = qconn.local_error() {
+                    local_error.error_code
                 } else {
                     let internal_error_code =
                         quiche::WireErrorCode::InternalError as u64;
-
-                    self.audit_log_stats
-                        .set_sent_conn_close_transport_error_code(
-                            internal_error_code as i64,
-                        );
-
                     let _ = qconn.close(false, internal_error_code, &[]);
-                    log::error!(
-                        "quiche::send failed, closing connection with INTERNAL_ERROR: {}",
-                        internal_error_code
-                    );
-                }
+
+                    internal_error_code
+                };
+
+                self.audit_log_stats
+                    .set_sent_conn_close_transport_error_code(error_code as i64);
 
                 Err(Box::new(e))
             },
@@ -492,13 +579,39 @@ where
     async fn flush_buffer_to_socket(&mut self, send_buf: &[u8]) {
         if self.write_state.bytes_written > 0 {
             let current_send_buf = &send_buf[..self.write_state.bytes_written];
+
+            // Select the socket based on path_id if available
+            let socket_index =
+                if let Some(path_id) = self.write_state.network_path_id {
+                    // Ensure path_id is within bounds (default to first socket if
+                    // not)
+                    if path_id < self.sockets.len() {
+                        path_id
+                    } else {
+                        log::warn!(
+                            "Path ID {} is out of bounds, using socket 0",
+                            path_id
+                        );
+                        0
+                    }
+                } else {
+                    // No path_id, use the first socket
+                    0
+                };
+
+            let socket = &self.sockets[socket_index];
+            let peer_addr = self.write_state.send_to.unwrap_or_else(|| {
+                // Default to the peer address if send_to is not set
+                self.cfg.peer_addr
+            });
+
             let send_res = if let (Some(udp_socket), true) =
-                (self.socket.as_udp_socket(), self.cfg.with_gso)
+                (socket.as_udp_socket(), self.cfg.with_gso)
             {
                 // Only UDP supports GSO
                 send_to(
                     udp_socket,
-                    self.cfg.peer_addr,
+                    peer_addr,
                     self.write_state.send_from.filter(|_| self.cfg.with_pktinfo),
                     current_send_buf,
                     self.write_state.segment_size,
@@ -507,9 +620,7 @@ where
                 )
                 .await
             } else {
-                self.socket
-                    .send_to(current_send_buf, self.cfg.peer_addr)
-                    .await
+                socket.send_to(current_send_buf, peer_addr).await
             };
 
             #[cfg(feature = "perf-quic-listener-metrics")]
@@ -529,6 +640,69 @@ where
         }
     }
 
+    fn sync_connection_ids(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        let mut current_cids = HashSet::new();
+
+        // Process all current source IDs
+        for cid in qconn.source_ids() {
+            let owned_cid = cid.clone().into_owned();
+            current_cids.insert(owned_cid.clone());
+
+            // Only send MapCid if this is a new CID we haven't mapped before
+            if !self.known_cids.contains(&owned_cid) {
+                log::trace!(
+                    "Mapping new SCID {:?} to connection ID {}",
+                    owned_cid,
+                    self.id
+                );
+                let _ = self.conn_map_cmd_tx.send(ConnectionMapCommand::MapCid(
+                    owned_cid.clone(),
+                    self.id,
+                ));
+                self.known_cids.insert(owned_cid);
+            }
+        }
+
+        // Process all retired SCIDs
+        while let Some((path_id, retired_scid)) =
+            qconn.retired_scid_on_path_next()
+        {
+            let owned_scid = retired_scid.into_owned();
+            log::trace!("Retired SCID {:?} on path ID {}", owned_scid, path_id);
+
+            // Remove from our known set and send unmap command
+            self.known_cids.remove(&owned_scid);
+            let _ = self
+                .conn_map_cmd_tx
+                .send(ConnectionMapCommand::UnmapCid(owned_scid));
+        }
+
+        // Check for CIDs that were previously known but are no longer in the
+        // current set This is a fallback mechanism in case
+        // retired_scid_on_path_next() missed something
+        let missing_cids: Vec<_> = self
+            .known_cids
+            .iter()
+            .filter(|cid| !current_cids.contains(*cid))
+            .cloned()
+            .collect();
+
+        for missing_cid in missing_cids {
+            log::trace!(
+                "CID {:?} is no longer active but wasn't explicitly retired",
+                missing_cid
+            );
+            self.known_cids.remove(&missing_cid);
+            let _ = self
+                .conn_map_cmd_tx
+                .send(ConnectionMapCommand::UnmapCid(missing_cid));
+        }
+
+        Ok(())
+    }
+
     /// Process the incoming packet
     fn process_incoming(
         &mut self, qconn: &mut QuicheConnection, mut pkt: Incoming,
@@ -544,6 +718,117 @@ where
             }
         } else {
             qconn.recv(&mut pkt.buf, recv_info)?;
+        }
+
+        Ok(())
+    }
+
+    /// Process all pending path events
+    fn process_path_events(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        while let Some((path_id, event)) = qconn.path_event_next() {
+            match event {
+                quiche::PathEvent::New(local_addr, peer_addr) => {
+                    log::info!(
+                        "Seen new path ({}, {}) with ID {}",
+                        local_addr,
+                        peer_addr,
+                        path_id
+                    );
+
+                    // If we're a server, we need to probe back the path in
+                    // response
+                    if qconn.is_server() && qconn.is_multipath_enabled() {
+                        if let Err(e) =
+                            qconn.probe_path(path_id, local_addr, peer_addr)
+                        {
+                            log::error!(
+                                "Cannot probe path ({},{}): {}",
+                                local_addr,
+                                peer_addr,
+                                e
+                            );
+                        }
+                    }
+                },
+
+                quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                    log::info!(
+                        "Path ({}, {}) with ID {} is now validated",
+                        local_addr,
+                        peer_addr,
+                        path_id
+                    );
+
+                    // Activate the path for multipath connections
+                    if qconn.is_multipath_enabled() {
+                        if let Err(e) = qconn.set_active(path_id, true) {
+                            log::error!(
+                                "Cannot set path active ({},{}): {}",
+                                local_addr,
+                                peer_addr,
+                                e
+                            );
+                        }
+                    }
+                },
+
+                quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                    log::info!(
+                        "Path ({}, {}) with ID {} failed validation",
+                        local_addr,
+                        peer_addr,
+                        path_id
+                    );
+                },
+
+                quiche::PathEvent::Closed(local_addr, peer_addr, err) => {
+                    log::info!(
+                        "Path ({}, {}) with ID {} is now closed and unusable; err = {}",
+                        local_addr,
+                        peer_addr,
+                        path_id,
+                        err,
+                    );
+                },
+
+                quiche::PathEvent::ReusedSourceConnectionId(
+                    cid_seq,
+                    old,
+                    new,
+                ) => {
+                    log::info!(
+                        "Peer reused cid seq {} (initially {:?}) on {:?} on path ID {}",
+                        cid_seq, old, new, path_id
+                    );
+                },
+
+                quiche::PathEvent::PeerMigrated(local_addr, peer_addr) => {
+                    log::info!(
+                        "Connection migrated to ({}, {}) on Path ID {}",
+                        local_addr,
+                        peer_addr,
+                        path_id
+                    );
+                    // TODO: Update routing map if needed
+                },
+
+                quiche::PathEvent::PeerPathStatus(addr, path_status) => {
+                    log::info!(
+                        "Peer asks status {:?} for {:?} on path ID {}",
+                        path_status,
+                        addr,
+                        path_id
+                    );
+
+                    if let Err(e) =
+                        qconn.set_path_status(path_id, path_status, false)
+                    {
+                        log::error!("Cannot follow status request: {}", e);
+                    }
+                },
+            }
         }
 
         Ok(())
@@ -718,7 +1003,8 @@ where
 impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
     fn from(value: IoWorker<Tx, M, S>) -> Self {
         Self {
-            socket: value.socket,
+            id: value.id,
+            sockets: value.sockets,
             shutdown_tx: value.shutdown_tx,
             cfg: value.cfg,
             audit_log_stats: value.audit_log_stats,
@@ -727,6 +1013,7 @@ impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: value.init_rx_time,
             metrics: value.metrics,
+            packet_scheduler: value.packet_scheduler,
         }
     }
 }

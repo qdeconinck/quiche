@@ -26,6 +26,10 @@
 
 //! Configuration for QUIC connections.
 
+use crate::quic::scheduler::BoxedScheduler;
+use crate::quic::scheduler::PacketScheduler;
+use crate::quic::scheduler::PacketSchedulerFactory;
+
 mod config;
 mod hooks;
 mod quic;
@@ -53,6 +57,13 @@ pub struct ConnectionParams<'a> {
     pub tls_cert: Option<TlsCertificatePaths<'a>>,
     /// Hooks to use for the connection.
     pub hooks: Hooks,
+    /// Packet scheduling algorithm to use.
+    ///
+    /// For available values, see
+    /// [`PacketSchedulingAlgorithm`](crate::quic::io::scheduler::PacketSchedulingAlgorithm).
+    ///
+    /// Defaults to `Default`.
+    pub packet_scheduler: Option<BoxedScheduler>,
 }
 
 impl<'a> ConnectionParams<'a> {
@@ -61,11 +72,13 @@ impl<'a> ConnectionParams<'a> {
     #[inline]
     pub fn new_server(
         settings: QuicSettings, tls_cert: TlsCertificatePaths<'a>, hooks: Hooks,
+        packet_scheduler: Option<BoxedScheduler>,
     ) -> Self {
         Self {
             settings,
             tls_cert: Some(tls_cert),
             hooks,
+            packet_scheduler,
         }
     }
 
@@ -74,12 +87,30 @@ impl<'a> ConnectionParams<'a> {
     #[inline]
     pub fn new_client(
         settings: QuicSettings, tls_cert: Option<TlsCertificatePaths<'a>>,
-        hooks: Hooks,
+        hooks: Hooks, packet_scheduler: Option<BoxedScheduler>,
     ) -> Self {
         Self {
             settings,
             tls_cert,
             hooks,
+            packet_scheduler,
         }
+    }
+
+    pub fn with_packet_scheduler(mut self, algorithm: &str) -> Self {
+        self.packet_scheduler = match PacketSchedulerFactory::from_str(algorithm)
+        {
+            Ok(scheduler) => Some(scheduler),
+            Err(_) => None,
+        };
+        self
+    }
+
+    pub fn with_custom_packet_scheduler<S>(mut self, scheduler: S) -> Self
+    where
+        S: PacketScheduler + 'static,
+    {
+        self.packet_scheduler = Some(std::sync::Arc::new(scheduler));
+        self
     }
 }

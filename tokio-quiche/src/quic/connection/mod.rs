@@ -66,6 +66,7 @@ use super::io::worker::IoWorkerParams;
 use super::io::worker::Running;
 use super::io::worker::RunningOrClosing;
 use super::io::worker::WriteState;
+use super::scheduler::BoxedScheduler;
 use super::QuicheConnection;
 use crate::buf_factory::PooledBuf;
 use crate::metrics::Metrics;
@@ -81,6 +82,8 @@ pub struct QuicConnectionStats {
     /// Aggregate connection statistics across all paths.
     pub stats: quiche::Stats,
     /// Specific statistics about the connection's active path.
+    /// TODO: Get all the path stats, not just the first one
+    /// (Vec<quiche::PathStats>)
     pub path_stats: Option<quiche::PathStats>,
 }
 pub(crate) type QuicConnectionStatsShared = Arc<Mutex<QuicConnectionStats>>;
@@ -140,6 +143,7 @@ pub struct Incoming {
     /// If set, then `buf` is a GRO buffer containing multiple packets.
     /// Each individual packet has a size of `gso` (except for the last one).
     pub gro: Option<u16>,
+    pub path_id: Option<u64>,
 }
 
 /// A QUIC connection that has not performed a handshake yet.
@@ -201,9 +205,9 @@ where
         }
     }
 
-    /// The local address this connection listens on.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.params.local_addr
+    /// The local addresses this connection listens on.
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.params.local_addrs.clone()
     }
 
     /// The remote address for this connection.
@@ -254,7 +258,7 @@ where
         self.params.metrics.connections_in_memory().inc();
 
         let conn = QuicConnection {
-            local_addr: self.params.local_addr,
+            local_addrs: self.params.local_addrs,
             peer_addr: self.params.peer_addr,
             audit_log_stats: Arc::clone(&self.audit_log_stats),
             stats: Arc::clone(&self.stats),
@@ -269,8 +273,13 @@ where
         let conn_stage = Handshake {
             handshake_info: self.params.handshake_info,
         };
+        let mut sockets = vec![];
+        for socket in self.params.sockets.iter() {
+            sockets.push(MaybeConnectedSocket::new(socket.clone()));
+        }
         let params = IoWorkerParams {
-            socket: MaybeConnectedSocket::new(self.params.socket),
+            id: self.id,
+            sockets,
             shutdown_tx: self.params.shutdown_tx,
             cfg: self.params.writer_cfg,
             audit_log_stats: self.audit_log_stats,
@@ -279,6 +288,7 @@ where
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: self.params.init_rx_time,
             metrics: self.params.metrics.clone(),
+            packet_scheduler: self.params.packet_scheduler,
         };
 
         let handshake_fut = async move {
@@ -416,9 +426,10 @@ where
     pub init_rx_time: Option<SystemTime>,
     pub handshake_info: HandshakeInfo,
     pub quiche_conn: QuicheConnection,
-    pub socket: Arc<Tx>,
-    pub local_addr: SocketAddr,
+    pub sockets: Vec<Arc<Tx>>,
+    pub local_addrs: Vec<SocketAddr>,
     pub peer_addr: SocketAddr,
+    pub packet_scheduler: Option<BoxedScheduler>,
 }
 
 /// Metadata about an established QUIC connection.
@@ -432,7 +443,7 @@ where
 /// See the [module-level docs](crate::quic) for an overview of how a QUIC
 /// connection is handled internally.
 pub struct QuicConnection {
-    local_addr: SocketAddr,
+    local_addrs: Vec<SocketAddr>,
     peer_addr: SocketAddr,
     audit_log_stats: Arc<QuicAuditStats>,
     stats: QuicConnectionStatsShared,
@@ -443,7 +454,12 @@ impl QuicConnection {
     /// The local address this connection listens on.
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.local_addrs[0]
+    }
+
+    #[inline]
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.local_addrs.clone()
     }
 
     /// The remote address for this connection.
@@ -709,6 +725,15 @@ pub enum QuicCommand {
     /// Unlike [`QuicConnection::stats()`], these statistics are not cached and
     /// instead are retrieved right before the command is executed.
     Stats(Box<dyn FnOnce(datagram_socket::SocketStats) + Send + 'static>),
+    /// Probe a specific path for a multipath connection.
+    ///
+    /// This command initiates a path validation for the provided local and peer
+    /// addresses. If the path validation succeeds, the path can be used for
+    /// sending packets.
+    ///
+    /// Note that this command can only be used by a client and with multipath
+    /// enabled.
+    ProbePath(quiche::PathId, SocketAddr, SocketAddr),
 }
 
 impl QuicCommand {
@@ -734,6 +759,11 @@ impl QuicCommand {
                 let stats_pair = QuicConnectionStats::from_conn(qconn);
                 (callback)(stats_pair.as_socket_stats());
             },
+            Self::ProbePath(path_id, local_addr, peer_addr) => {
+                if !qconn.is_server() && qconn.is_multipath_enabled() {
+                    let _ = qconn.probe_path(path_id, local_addr, peer_addr);
+                }
+            },
         }
     }
 }
@@ -745,6 +775,12 @@ impl fmt::Debug for QuicCommand {
                 f.debug_tuple("ConnectionClose").field(b).finish(),
             Self::Custom(_) => f.debug_tuple("Custom").finish_non_exhaustive(),
             Self::Stats(_) => f.debug_tuple("Stats").finish_non_exhaustive(),
+            Self::ProbePath(path_id, local_addr, peer_addr) => f
+                .debug_struct("ProbePath")
+                .field("path_id", path_id)
+                .field("local_addr", local_addr)
+                .field("peer_addr", peer_addr)
+                .finish(),
         }
     }
 }
