@@ -84,7 +84,7 @@ impl FromStr for PacketSchedulingAlgorithm {
             "roundrobin" => Ok(PacketSchedulingAlgorithm::RoundRobin),
             "random" => Ok(PacketSchedulingAlgorithm::Random),
             "lowestlatency" => Ok(PacketSchedulingAlgorithm::LowestLatency),
-            _ => Err(quiche::Error::PacketScheduler),
+            _ => Err(quiche::Error::UnknownPacketScheduler),
         }
     }
 }
@@ -92,10 +92,11 @@ impl FromStr for PacketSchedulingAlgorithm {
 /// Trait defining a packet scheduler that can determine which path to use for
 /// sending packets
 pub trait PacketScheduler: Debug + Send + Sync + 'static {
-    /// Returns an ordered list of paths according to the scheduler's algorithm
+    /// Returns an ordered list of paths according to the scheduler's algorithm.
     fn schedule<'a>(
         &self, conn: &'a QuicheConnection,
     ) -> Box<dyn Iterator<Item = (SocketAddr, SocketAddr)> + 'a>;
+
     /// Get the next path to send a packet on
     fn next_path(
         &self, conn: &QuicheConnection,
@@ -113,7 +114,7 @@ pub struct PacketSchedulerFactory;
 
 impl PacketSchedulerFactory {
     /// Create a new scheduler instance based on the algorithm
-    pub fn new(algorithm: PacketSchedulingAlgorithm) -> BoxedScheduler {
+    pub fn create(algorithm: PacketSchedulingAlgorithm) -> BoxedScheduler {
         match algorithm {
             PacketSchedulingAlgorithm::MinRTT => Arc::new(MinRTTScheduler::new()),
             PacketSchedulingAlgorithm::RoundRobin =>
@@ -125,9 +126,9 @@ impl PacketSchedulerFactory {
     }
 
     /// Create a new scheduler instance from a string name
-    pub fn from_str(name: &str) -> Result<BoxedScheduler, quiche::Error> {
+    pub fn from_name(name: &str) -> Result<BoxedScheduler, quiche::Error> {
         let algorithm = PacketSchedulingAlgorithm::from_str(name)?;
-        Ok(Self::new(algorithm))
+        Ok(Self::create(algorithm))
     }
 }
 
@@ -138,6 +139,12 @@ pub struct MinRTTScheduler;
 impl MinRTTScheduler {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for MinRTTScheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -157,7 +164,7 @@ impl PacketScheduler for MinRTTScheduler {
         &self, conn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
-            let path = conn.path_stats().find(|p| p.path_id == path_id as u64);
+            let path = conn.path_stats().find(|p| p.path_id == path_id);
             if let Some(path) = path {
                 return Some((path.local_addr, path.peer_addr));
             }
@@ -200,6 +207,12 @@ impl RoundRobinScheduler {
     }
 }
 
+impl Default for RoundRobinScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PacketScheduler for RoundRobinScheduler {
     fn schedule<'a>(
         &self, conn: &'a QuicheConnection,
@@ -215,7 +228,7 @@ impl PacketScheduler for RoundRobinScheduler {
         &self, conn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
-            let path = conn.path_stats().find(|p| p.path_id == path_id as u64);
+            let path = conn.path_stats().find(|p| p.path_id == path_id);
             if let Some(path) = path {
                 return Some((path.local_addr, path.peer_addr));
             }
@@ -256,6 +269,12 @@ impl RandomScheduler {
     }
 }
 
+impl Default for RandomScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PacketScheduler for RandomScheduler {
     fn schedule<'a>(
         &self, conn: &'a QuicheConnection,
@@ -269,7 +288,7 @@ impl PacketScheduler for RandomScheduler {
         &self, conn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
-            let path = conn.path_stats().find(|p| p.path_id == path_id as u64);
+            let path = conn.path_stats().find(|p| p.path_id == path_id);
             if let Some(path) = path {
                 return Some((path.local_addr, path.peer_addr));
             }
@@ -302,6 +321,12 @@ pub struct LowestLatencyScheduler;
 impl LowestLatencyScheduler {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for LowestLatencyScheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

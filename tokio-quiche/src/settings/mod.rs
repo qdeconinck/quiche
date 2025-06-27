@@ -62,7 +62,7 @@ pub struct ConnectionParams<'a> {
     /// For available values, see
     /// [`PacketSchedulingAlgorithm`](crate::quic::io::scheduler::PacketSchedulingAlgorithm).
     ///
-    /// Defaults to `Default`.
+    /// Defaults to `None`.
     pub packet_scheduler: Option<BoxedScheduler>,
 }
 
@@ -98,7 +98,7 @@ impl<'a> ConnectionParams<'a> {
     }
 
     pub fn with_packet_scheduler(mut self, algorithm: &str) -> Self {
-        self.packet_scheduler = match PacketSchedulerFactory::from_str(algorithm)
+        self.packet_scheduler = match PacketSchedulerFactory::from_name(algorithm)
         {
             Ok(scheduler) => Some(scheduler),
             Err(_) => None,

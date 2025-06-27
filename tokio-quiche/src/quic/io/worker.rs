@@ -494,12 +494,10 @@ where
                             self.write_state.num_pkts += 1;
                             self.write_state.send_from = send_from;
                             self.write_state.send_to = send_to;
-                            let network_path_id = qconn
-                                .network_path_id_from(
-                                    send_from.unwrap(),
-                                    send_to.unwrap(),
-                                )
-                                .map(|id| id as usize); // TODO: check the Option
+                            let network_path_id = qconn.network_path_id_from(
+                                send_from.unwrap(),
+                                send_to.unwrap(),
+                            );
                             self.write_state.network_path_id = network_path_id;
 
                             return Ok(packet_size);
@@ -546,8 +544,7 @@ where
                 self.write_state.send_from = send_from;
                 self.write_state.send_to = send_to;
                 let network_path_id = qconn
-                    .network_path_id_from(send_from.unwrap(), send_to.unwrap())
-                    .map(|id| id as usize); // TODO: check the Option
+                    .network_path_id_from(send_from.unwrap(), send_to.unwrap());
                 self.write_state.network_path_id = network_path_id;
 
                 Ok(packet_size)
@@ -600,7 +597,7 @@ where
                 };
 
             let socket = &self.sockets[socket_index];
-            let peer_addr = self.write_state.send_to.unwrap_or_else(|| {
+            let peer_addr = self.write_state.send_to.unwrap_or({
                 // Default to the peer address if send_to is not set
                 self.cfg.peer_addr
             });

@@ -218,9 +218,9 @@ where
     App: ApplicationOverQuic,
 {
     let sockets: MultiSocket<Tx, Rx> = sockets.try_into()?;
+    #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
     let mut caps = SocketCapabilities::default();
 
-    #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
     for socket in sockets.paths.iter() {
         #[cfg(target_os = "linux")]
         if let Some(s) = socket.as_udp_socket() {

@@ -369,9 +369,6 @@ where
             match rx.poll_recv_from(cx, &mut buf) {
                 Poll::Ready(Ok(peer_addr)) => {
                     let bytes = buf.filled().len();
-                    if bytes == 0 {
-                        return Poll::Ready(Ok(None)); // No data
-                    }
 
                     let mut buf = std::mem::replace(
                         &mut self.buffers[path_id],
@@ -379,14 +376,14 @@ where
                     );
                     buf.truncate(bytes);
 
-                    Poll::Ready(Ok(Some(Incoming {
-                        peer_addr,
-                        local_addr,
-                        buf,
+                    Poll::Ready(Ok(PollRecvMultiData {
+                        bytes,
+                        src_addr: peer_addr,
+                        dst_addr_override: None,
                         rx_time: None,
                         gro: None,
-                        path_id: Some(path_id as u64), // Include path ID
-                    })))
+                        path_id: Some(path_id as u64),
+                    }))
                 },
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                 Poll::Pending => Poll::Pending,

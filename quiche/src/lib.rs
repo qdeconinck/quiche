@@ -608,7 +608,7 @@ pub enum Error {
     UnknownPath,
 
     /// Error in the packet scheduling process.
-    PacketScheduler,
+    UnknownPacketScheduler,
 }
 
 /// QUIC error codes sent on the wire.
@@ -725,7 +725,7 @@ impl Error {
             Error::OutOfPathId => -23,
             Error::NoMorePath => -24,
             Error::UnknownPath => -25,
-            Error::PacketScheduler => -26,
+            Error::UnknownPacketScheduler => -26,
         }
     }
 }
@@ -8945,12 +8945,10 @@ impl Connection {
         Ok((recv_pid, recv_npid))
     }
 
-    /// Selects the QUIC and network paths on which the next packet must be
-    /// sent.
-    fn get_send_network_path_id(
+    fn need_probing_packet(
         &self, path_id: Option<PathId>, from: Option<SocketAddr>,
         to: Option<SocketAddr>,
-    ) -> Result<(PathId, path::NetworkPathId)> {
+    ) -> Option<(PathId, path::NetworkPathId)> {
         // A probing packet must be sent, but only if the connection is fully
         // established.
         if self.is_established() {
@@ -8971,8 +8969,49 @@ impl Connection {
                 });
 
             if let Some((npid, Some(path_id))) = probing.next() {
-                return Ok((path_id, npid));
+                return Some((path_id, npid));
             }
+        }
+
+        None
+    }
+
+    fn need_path_ack(
+        &self, path_id: Option<PathId>,
+    ) -> Option<(PathId, path::NetworkPathId)> {
+        // When using multiple packet number spaces, let's force PATH_ACK sending
+        // on their corresponding paths.
+        if self.is_multipath_enabled() {
+            if let Some(pid) = self
+                .pkt_num_spaces
+                .spaces
+                .application_data_space_ids()
+                .filter(|space_id| {
+                    path_id.is_none() || Some(*space_id) == path_id
+                })
+                .find_map(|path_id| {
+                    self.pkt_num_spaces
+                        .is_ready(packet::Epoch::Application, Some(path_id))
+                        .then(|| self.paths.pid_from_path_id(path_id))
+                        .flatten()
+                })
+            {
+                let p = self.paths.get(pid).ok()?;
+                return Some((p.path_id(), p.network_path_id()));
+            }
+        }
+
+        None
+    }
+
+    /// Selects the QUIC and network paths on which the next packet must be
+    /// sent.
+    fn get_send_network_path_id(
+        &self, path_id: Option<PathId>, from: Option<SocketAddr>,
+        to: Option<SocketAddr>,
+    ) -> Result<(PathId, path::NetworkPathId)> {
+        if let Some((pid, npid)) = self.need_probing_packet(path_id, from, to) {
+            return Ok((pid, npid));
         }
 
         let mut consider_backup = false;
@@ -9009,26 +9048,8 @@ impl Connection {
             }
         }
 
-        // When using multiple packet number spaces, let's force PATH_ACK sending
-        // on their corresponding paths.
-        if self.is_multipath_enabled() {
-            if let Some(pid) = self
-                .pkt_num_spaces
-                .spaces
-                .application_data_space_ids()
-                .filter(|space_id| {
-                    path_id.is_none() || Some(*space_id) == path_id
-                })
-                .find_map(|path_id| {
-                    self.pkt_num_spaces
-                        .is_ready(packet::Epoch::Application, Some(path_id))
-                        .then(|| self.paths.pid_from_path_id(path_id))
-                        .flatten()
-                })
-            {
-                let p = self.paths.get(pid)?;
-                return Ok((p.path_id(), p.network_path_id()));
-            }
+        if let Some((path_id, npid)) = self.need_path_ack(path_id) {
+            return Ok((path_id, npid));
         }
 
         if let Ok((p, np)) = self.paths.get_any_active() {
@@ -9056,52 +9077,10 @@ impl Connection {
         &self, path_id: Option<PathId>, from: Option<SocketAddr>,
         to: Option<SocketAddr>,
     ) -> Option<(PathId, path::NetworkPathId)> {
-        // A probing packet must be sent, but only if the connection is fully
-        // established.
-        if self.is_established() {
-            let mut probing = self
-                .paths
-                .network_iter()
-                .filter(|(_, np)| from.is_none() || Some(np.local_addr()) == from)
-                .filter(|(_, np)| to.is_none() || Some(np.peer_addr()) == to)
-                .filter(|(_, np)| !np.active_dcid_seqs.is_empty())
-                .filter(|(_, np)| np.probing_required())
-                .map(|(npid, np)| {
-                    (
-                        npid,
-                        np.active_dcid_seqs.iter().map(|(_, pc)| pc.0).find(
-                            |pid| path_id.is_none() || Some(*pid) == path_id,
-                        ),
-                    )
-                });
-
-            if let Some((npid, Some(path_id))) = probing.next() {
-                return Some((path_id, npid));
-            }
+        if let Some((pid, npid)) = self.need_probing_packet(path_id, from, to) {
+            return Some((pid, npid));
         }
-
-        // When using multiple packet number spaces, let's force PATH_ACK sending
-        // on their corresponding paths.
-        if self.is_multipath_enabled() {
-            if let Some(pid) = self
-                .pkt_num_spaces
-                .spaces
-                .application_data_space_ids()
-                .filter(|space_id| {
-                    path_id.is_none() || Some(*space_id) == path_id
-                })
-                .find_map(|path_id| {
-                    self.pkt_num_spaces
-                        .is_ready(packet::Epoch::Application, Some(path_id))
-                        .then(|| self.paths.pid_from_path_id(path_id))
-                        .flatten()
-                })
-            {
-                let p = self.paths.get(pid).ok()?;
-                return Some((p.path_id(), p.network_path_id()));
-            }
-        }
-        None
+        self.need_path_ack(path_id)
     }
 
     /// Try to assign a spare DCID for the given path ID to the given
