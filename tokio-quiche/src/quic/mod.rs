@@ -221,8 +221,8 @@ where
     #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
     let mut caps = SocketCapabilities::default();
 
+    #[cfg(target_os = "linux")]
     for socket in sockets.paths.iter() {
-        #[cfg(target_os = "linux")]
         if let Some(s) = socket.as_udp_socket() {
             caps = SocketCapabilities::apply_all_and_get_compatibility(
                 s,

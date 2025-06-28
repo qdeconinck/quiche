@@ -9,6 +9,7 @@ members = [
   "quiche",
   "task-killswitch",
   "tokio-quiche",
+  "tokio-quiche/examples/http",
 ]
 exclude = ["fuzz", "tools/http3_test"]
 resolver = "2"

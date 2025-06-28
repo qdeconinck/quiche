@@ -725,7 +725,7 @@ pub enum QuicCommand {
     /// Unlike [`QuicConnection::stats()`], these statistics are not cached and
     /// instead are retrieved right before the command is executed.
     Stats(Box<dyn FnOnce(datagram_socket::SocketStats) + Send + 'static>),
-    /// Probe a specific path for a multipath connection.
+    /// Open a specific path for a multipath connection.
     ///
     /// This command initiates a path validation for the provided local and peer
     /// addresses. If the path validation succeeds, the path can be used for
@@ -733,7 +733,7 @@ pub enum QuicCommand {
     ///
     /// Note that this command can only be used by a client and with multipath
     /// enabled.
-    ProbePath(quiche::PathId, SocketAddr, SocketAddr),
+    OpenPath(Option<quiche::PathId>, SocketAddr, SocketAddr),
 }
 
 impl QuicCommand {
@@ -759,8 +759,11 @@ impl QuicCommand {
                 let stats_pair = QuicConnectionStats::from_conn(qconn);
                 (callback)(stats_pair.as_socket_stats());
             },
-            Self::ProbePath(path_id, local_addr, peer_addr) => {
+            Self::OpenPath(path_id, local_addr, peer_addr) => {
                 if !qconn.is_server() && qconn.is_multipath_enabled() {
+                    let path_id = path_id.unwrap_or_else(|| {
+                        qconn.next_available_path_id().unwrap()
+                    });
                     let _ = qconn.probe_path(path_id, local_addr, peer_addr);
                 }
             },
@@ -775,8 +778,8 @@ impl fmt::Debug for QuicCommand {
                 f.debug_tuple("ConnectionClose").field(b).finish(),
             Self::Custom(_) => f.debug_tuple("Custom").finish_non_exhaustive(),
             Self::Stats(_) => f.debug_tuple("Stats").finish_non_exhaustive(),
-            Self::ProbePath(path_id, local_addr, peer_addr) => f
-                .debug_struct("ProbePath")
+            Self::OpenPath(path_id, local_addr, peer_addr) => f
+                .debug_struct("OpenPath")
                 .field("path_id", path_id)
                 .field("local_addr", local_addr)
                 .field("peer_addr", peer_addr)

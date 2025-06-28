@@ -1,0 +1,23 @@
+[package]
+name = "http3-example"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "http3-client"
+path = "src/client.rs"
+
+[[bin]]
+name = "http3-server"
+path = "src/server.rs"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+env_logger = "0.11"
+foundations = "4"
+futures = "0.3"
+log = "0.4"
+tokio-quiche = { path = "../..", features = ["capture_keylogs"] }
+tokio = { version = "1", features = ["full"] }
+url = "2.5"
+urlencoding = "2.1"

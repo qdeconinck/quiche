@@ -75,7 +75,9 @@ use crate::metrics::Metrics;
 use crate::quic::HandshakeInfo;
 use crate::quic::QuicCommand;
 use crate::quic::QuicheConnection;
+use crate::quic::SimpleConnectionIdGenerator;
 use crate::ApplicationOverQuic;
+use crate::ConnectionIdGenerator;
 use crate::QuicResult;
 
 pub use self::client::ClientEventStream;
@@ -880,6 +882,27 @@ impl<H: DriverHooks> H3Driver<H> {
         }
         Ok(())
     }
+
+    fn provide_init_scids(&self, qconn: &mut QuicheConnection) {
+        use rand::Rng;
+        for path_id in qconn.path_ids() {
+            while qconn.scids_left_on_path(path_id) > 0 {
+                let scid = SimpleConnectionIdGenerator.new_connection_id(0);
+                let mut reset_token = [0; 16];
+                rand::thread_rng().fill(&mut reset_token);
+                let reset_token = u128::from_be_bytes(reset_token);
+                if qconn
+                    .new_scid_on_path(path_id, &scid, reset_token, false)
+                    .is_err()
+                {
+                    // If we can't add a new SCID, we can't continue.
+                    // This is a fatal error.
+                    log::error!("Failed to add new SCID on path {path_id}");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl<H: DriverHooks> H3Driver<H> {
@@ -993,6 +1016,8 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         self.conn = Some(conn);
 
         H::conn_established(self, quiche_conn, handshake_info)?;
+
+        self.provide_init_scids(quiche_conn);
         Ok(())
     }
 

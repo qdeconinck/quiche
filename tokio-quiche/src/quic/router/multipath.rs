@@ -28,7 +28,6 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::ready;
 use std::task::Context;
 use std::task::Poll;
 use std::time::SystemTime;
@@ -397,6 +396,7 @@ where
             use std::net::SocketAddrV4;
             use std::net::SocketAddrV6;
             use std::os::fd::AsRawFd;
+            use std::task::ready;
             use tokio::io::Interest;
 
             let (ref rx, local_addr) = self.path_rxs[path_id];
@@ -556,6 +556,7 @@ where
     fn poll_path_simple(
         &mut self, cx: &mut Context<'_>, path_id: usize,
     ) -> Poll<io::Result<PollRecvMultiData>> {
+        use std::task::ready;
         // Fallback implementation for non-UDP sockets on Linux
         let (ref mut rx, _) = self.path_rxs[path_id];
         let mut buf = tokio::io::ReadBuf::new(&mut self.buffers[path_id]);
