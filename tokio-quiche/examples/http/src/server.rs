@@ -38,11 +38,19 @@ struct Args {
     initial_max_path_id: Option<u64>,
 
     /// Path to TLS certificate file
-    #[arg(long = "cert", default_value = "../cert.pem")]
+    #[arg(
+        short = 'c',
+        long = "cert",
+        default_value = "tokio-quiche/examples/cert.pem"
+    )]
     cert_path: String,
 
     /// Path to TLS private key file
-    #[arg(long = "key", default_value = "../key.pem")]
+    #[arg(
+        short = 'k',
+        long = "key",
+        default_value = "tokio-quiche/examples/key.pem"
+    )]
     key_path: String,
 
     /// Address to bind to
@@ -85,9 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Using packet scheduler: {:?}", quic_params.packet_scheduler);
 
     if let Some(max_path_id) = args.initial_max_path_id {
-        info!(
-            "Multipath enabled with initial_max_path_id: {max_path_id}"
-        );
+        info!("Multipath enabled with initial_max_path_id: {max_path_id}");
         quic_params.settings.initial_max_path_id = Some(max_path_id);
     }
 

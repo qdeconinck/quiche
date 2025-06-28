@@ -5,10 +5,10 @@ QUIC) support.
 
 ## Prerequisites
 
-The server requires TLS certificates. By default, it looks for them in the parent directory:
+The server requires TLS certificates. By default, it looks for them in the tokio-quiche examples directory:
 
-- `../cert.pem` - TLS certificate
-- `../key.pem` - TLS private key
+- `tokio-quiche/examples/cert.pem` - TLS certificate
+- `tokio-quiche/examples/key.pem` - TLS private key
 
 ## Building
 

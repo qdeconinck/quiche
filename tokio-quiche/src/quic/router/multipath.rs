@@ -30,7 +30,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-use std::time::SystemTime;
 
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
@@ -352,18 +351,14 @@ where
         #[cfg(not(target_os = "linux"))]
         {
             // Simple polling for non-Linux platforms
-            let (ref mut rx, _) = self.path_rxs[path_id];
-            let mut buf = tokio::io::ReadBuf::new(&mut self.buffers[path_id]);
+            let (ref mut rx, _local_addr) = &mut self.path_rxs[path_id];
+            let buf = &mut self.buffers[path_id];
 
-            match rx.poll_recv_from(cx, &mut buf) {
+            // Create a ReadBuf to read into
+            let mut read_buf = tokio::io::ReadBuf::new(buf);
+            match rx.poll_recv_from(cx, &mut read_buf) {
                 Poll::Ready(Ok(peer_addr)) => {
-                    let bytes = buf.filled().len();
-
-                    let mut buf = std::mem::replace(
-                        &mut self.buffers[path_id],
-                        BufFactory::get_max_buf(),
-                    );
-                    buf.truncate(bytes);
+                    let bytes = read_buf.filled().len();
 
                     Poll::Ready(Ok(PollRecvData {
                         bytes,
@@ -450,7 +445,7 @@ where
                                     }
                                 },
                                 ControlMessageOwned::ScmTimestampns(val) => {
-                                    rx_time = SystemTime::UNIX_EPOCH
+                                    rx_time = std::time::SystemTime::UNIX_EPOCH
                                         .checked_add(val.into());
                                     if let Some(delta) =
                                         rx_time.and_then(|rx_time| {
