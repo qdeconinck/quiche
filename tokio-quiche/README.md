@@ -2,15 +2,13 @@
 
 Bridging the gap between [quiche][quiche] and [tokio][tokio].
 
-tokio-quiche connects [quiche::Connection][q-connection]s and
-[quiche::h3::Connection][q-h3-connection]s to tokio's event loop. Users have the
-choice between implementing their own, custom <code>[ApplicationOverQuic]</code>
-or using the ready-made <code>[H3Driver]</code> for HTTP/3 clients and servers.
+tokio-quiche connects [quiche::Connection][q-connection]s and [quiche::h3::Connection][q-h3-connection]s to tokio's
+event loop. Users have the choice between implementing their own, custom <code>[ApplicationOverQuic]</code> or using the
+ready-made <code>[H3Driver]</code> for HTTP/3 clients and servers.
 
 # Starting an HTTP/3 Server
 
-A server listens on a UDP socket for QUIC connections and spawns a new tokio
-task to handle each individual connection.
+A server listens on a UDP socket for QUIC connections and spawns a new tokio task to handle each individual connection.
 
 ```rust
 use foundations::telemetry::log;
@@ -139,24 +137,90 @@ while let Some(event) = controller.event_receiver_mut().recv().await {
 }
 ```
 
-**Note**: Omited in these two examples are is the use of `stream_id` to track
-multiplexed requests within the same connection.
+**Note**: Omited in these two examples are is the use of `stream_id` to track multiplexed requests within the same
+connection.
 
 # Feature Flags
 
-tokio-quiche supports a number of feature flags to enable experimental features,
-performance enhancements, and additional telemetry. By default, no feature flags are
-enabled.
+tokio-quiche supports a number of feature flags to enable experimental features, performance enhancements, and
+additional telemetry. By default, no feature flags are enabled.
 
 - `rpk`: Support for raw public keys (RPK) in QUIC handshakes (via [boring]).
 - `capture_keylogs`: Optional `SSLKEYLOGFILE` capturing for QUIC connections.
-- `gcongestion`: Replace quiche's original congestion control implementation with one
-   adapted from google/quiche (via quiche-mallard).
+- `gcongestion`: Replace quiche's original congestion control implementation with one adapted from google/quiche (via
+  quiche-mallard).
 - `zero-copy`: Use zero-copy sends with quiche-mallard (implies `gcongestion`).
-- `perf-quic-listener-metrics`: Extra telemetry for QUIC handshake durations,
-  including protocol overhead and network delays.
+- `perf-quic-listener-metrics`: Extra telemetry for QUIC handshake durations, including protocol overhead and network
+  delays.
 - `tokio-task-metrics`: Scheduling & poll duration histograms for tokio tasks.
 
+# Multipath QUIC (MPQUIC) Support
+
+tokio-quiche supports Multipath QUIC (MPQUIC), allowing connections to use multiple network paths simultaneously for
+improved performance and reliability.
+
+## Enabling Multipath
+
+To enable multipath support, set the `initial_max_path_id` parameter in your QUIC settings:
+
+```rust
+use tokio_quiche::{ConnectionParams, settings::QuicSettings};
+
+// Enable multipath with up to 2 additional paths (3 total including primary)
+let mut quic_settings = QuicSettings::default();
+quic_settings.initial_max_path_id = Some(2);
+
+let params = ConnectionParams::new_server(
+    quic_settings,
+    tls_settings,
+    http3_settings,
+);
+```
+
+## Packet Schedulers
+
+When using multipath, you can configure packet scheduling algorithms to determine how packets are distributed across
+available paths:
+
+### Available Schedulers
+
+- **MinRTT** (`"minrtt"`): Selects the path with the lowest round-trip time
+- **RoundRobin** (`"roundrobin"`): Cycles through available paths in order
+- **Random** (`"random"`): Randomly selects among available paths
+- **LowestLatency** (`"lowestlatency"`): Uses RTT + 2×RTT variance for path selection
+
+### Configuration
+
+```rust
+// Using a built-in scheduler
+let params = ConnectionParams::default()
+    .with_packet_scheduler("minrtt");
+
+// Using a custom scheduler implementation
+let custom_scheduler = MyCustomScheduler::new();
+let params = ConnectionParams::default()
+    .with_custom_packet_scheduler(custom_scheduler);
+```
+
+## Examples
+
+The `examples/http` directory contains HTTP/3 client and server examples with MPQUIC support:
+
+### Server with Multipath
+
+```bash
+# Start server with multipath enabled (max 2 paths) using MinRTT scheduler
+cargo run --bin http3-server -- --initial-max-path-id 2 --packet-scheduler minrtt .
+```
+
+### Client with Multiple Addresses
+
+```bash
+# Connect using multiple local addresses for multipath
+cargo run --bin http3-client -- -m -A 127.0.0.1:1234 -A 127.0.0.1:5678 https://localhost:4433/
+```
+
+For detailed examples and configuration options, see the [HTTP/3 example app documentation](examples/http/README.md).
 
 # Server usage architecture
 

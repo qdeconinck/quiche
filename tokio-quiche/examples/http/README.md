@@ -84,7 +84,7 @@ cargo run --bin http3-client -- --help
 cargo run --bin http3-client -- -m -A 127.0.0.1:1234 -A 127.0.0.1:5678
 
 # Request specific URL with multipath
-cargo run --bin http3-client -- http://127.0.0.1:4433/test.txt -m -A 127.0.0.1:1234 -A 127.0.0.1:5678
+cargo run --bin http3-client -- https://127.0.0.1:4433/test.txt -m -A 127.0.0.1:1234 -A 127.0.0.1:5678
 
 # Multiple addresses with custom probe timeout
 cargo run --bin http3-client -- -m -A 127.0.0.1:1234 -A 127.0.0.1:5678 --probe-timeout 10
