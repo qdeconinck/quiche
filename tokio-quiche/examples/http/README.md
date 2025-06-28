@@ -23,7 +23,7 @@ cargo build
 ### Basic Usage
 
 ```bash
-cargo run --bin http3-server
+RUST_LOG=debug cargo run --bin http3-server
 ```
 
 The server will listen on `0.0.0.0:4433` and serve files from the current directory.
@@ -52,8 +52,8 @@ Think of attributing a packet scheduler if you enable multipath. Available optio
 ### Multipath Server Example
 
 ```bash
-# Enable multipath with max 2 paths and round-robin scheduler
-cargo run --bin http3-server -- --initial-max-path-id 2 --packet-scheduler RoundRobin
+# Enable multipath with max 2 paths and MinRTT scheduler
+cargo run --bin http3-server -- --initial-max-path-id 2 --packet-scheduler minrtt .
 ```
 
 ## Running the Client
@@ -61,7 +61,7 @@ cargo run --bin http3-server -- --initial-max-path-id 2 --packet-scheduler Round
 ### Basic Usage
 
 ```bash
-cargo run --bin http3-client
+RUST_LOG=debug cargo run --bin http3-client
 ```
 
 The client will connect to `https://127.0.0.1:4433/` and display the response.

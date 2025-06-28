@@ -109,6 +109,7 @@ struct PollRecvData {
     dst_addr_override: Option<SocketAddr>,
     rx_time: Option<SystemTime>,
     gro: Option<u16>,
+    path_id: u64,
 }
 
 /// A message to the listener notifiying a mapping for a connection should be
@@ -388,6 +389,7 @@ where
             rx_time: None,
             gro: None,
             dst_addr_override: None,
+            path_id: 0,
         }))
     }
 
@@ -542,6 +544,7 @@ where
                             dst_addr_override,
                             rx_time,
                             gro,
+                            path_id: 0,
                         }));
                     },
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -644,6 +647,7 @@ where
                     dst_addr_override,
                     rx_time,
                     gro,
+                    path_id,
                 })) => {
                     let mut buf = std::mem::replace(
                         &mut self.current_buf,
@@ -664,7 +668,7 @@ where
                         buf,
                         rx_time,
                         gro,
-                        path_id: None,
+                        path_id,
                     });
 
                     if let Err(e) = res {

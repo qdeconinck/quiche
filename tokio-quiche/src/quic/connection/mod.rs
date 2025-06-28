@@ -143,7 +143,7 @@ pub struct Incoming {
     /// If set, then `buf` is a GRO buffer containing multiple packets.
     /// Each individual packet has a size of `gso` (except for the last one).
     pub gro: Option<u16>,
-    pub path_id: Option<u64>,
+    pub path_id: u64,
 }
 
 /// A QUIC connection that has not performed a handshake yet.

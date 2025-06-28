@@ -86,8 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(max_path_id) = args.initial_max_path_id {
         info!(
-            "Multipath enabled with initial_max_path_id: {}",
-            max_path_id
+            "Multipath enabled with initial_max_path_id: {max_path_id}"
         );
         quic_params.settings.initial_max_path_id = Some(max_path_id);
     }
@@ -120,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(handle_connection(controller, root_dir.clone()));
             },
             Err(e) => {
-                error!("Failed to accept connection: {}", e);
+                error!("Failed to accept connection: {e}");
             },
         }
     }
@@ -143,7 +142,7 @@ async fn handle_connection(
                 headers,
                 ..
             }) => {
-                info!("Received headers on stream {}: {:?}", stream_id, headers);
+                info!("Received headers on stream {stream_id}: {headers:?}");
 
                 let path = headers
                     .iter()
@@ -157,7 +156,7 @@ async fn handle_connection(
                     .map(|h| String::from_utf8_lossy(h.value()))
                     .unwrap_or_default();
 
-                info!("Request: {} {}", method, path);
+                info!("Request: {method} {path}");
 
                 if method != "GET" {
                     send_error_response(send, 405, "Method Not Allowed").await;
@@ -175,7 +174,7 @@ async fn handle_connection(
                 match serve_file(send, &file_path).await {
                     Ok(_) =>
                         info!("Successfully served: {}", file_path.display()),
-                    Err(e) => error!("Failed to serve file: {}", e),
+                    Err(e) => error!("Failed to serve file: {e}"),
                 }
             },
             H3Event::BodyBytesReceived {
@@ -184,15 +183,14 @@ async fn handle_connection(
                 fin,
             } => {
                 info!(
-                    "Received {} bytes on stream {} (fin={})",
-                    num_bytes, stream_id, fin
+                    "Received {num_bytes} bytes on stream {stream_id} (fin={fin})"
                 );
             },
             H3Event::StreamClosed { stream_id } => {
-                info!("Stream {} closed", stream_id);
+                info!("Stream {stream_id} closed");
             },
             event => {
-                info!("Received event: {:?}", event);
+                info!("Received event: {event:?}");
             },
         }
     }
@@ -273,7 +271,7 @@ async fn send_error_response(
         ]))
         .await
     {
-        error!("Failed to send error headers: {}", e);
+        error!("Failed to send error headers: {e}");
         return;
     }
 
@@ -284,6 +282,6 @@ async fn send_error_response(
         ))
         .await
     {
-        error!("Failed to send error body: {}", e);
+        error!("Failed to send error body: {e}");
     }
 }

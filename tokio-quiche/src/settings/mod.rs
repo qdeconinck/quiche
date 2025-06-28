@@ -98,11 +98,7 @@ impl<'a> ConnectionParams<'a> {
     }
 
     pub fn with_packet_scheduler(mut self, algorithm: &str) -> Self {
-        self.packet_scheduler = match PacketSchedulerFactory::from_name(algorithm)
-        {
-            Ok(scheduler) => Some(scheduler),
-            Err(_) => None,
-        };
+        self.packet_scheduler = PacketSchedulerFactory::from_name(algorithm).ok();
         self
     }
 

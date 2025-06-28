@@ -49,19 +49,9 @@ use crate::quic::router::ConnStream;
 use crate::quic::router::ConnectionMap;
 use crate::quic::router::ConnectionMapCommand;
 use crate::quic::router::InitialPacketHandler;
+use crate::quic::router::PollRecvData;
 use crate::quic::Incoming;
 use crate::settings::Config;
-
-/// Modified version of `PollRecvData` to include path information
-#[derive(Debug)]
-struct PollRecvMultiData {
-    bytes: usize,
-    src_addr: std::net::SocketAddr,
-    dst_addr_override: Option<std::net::SocketAddr>,
-    rx_time: Option<SystemTime>,
-    gro: Option<u16>,
-    path_id: u64, // Path identifier
-}
 
 /// A router that can handle incoming packets from multiple network paths.
 pub struct MultiPathInboundRouter<Tx, Rx, M, I>
@@ -358,11 +348,11 @@ where
     // Poll a single path for incoming data
     fn poll_path(
         &mut self, cx: &mut Context<'_>, path_id: usize,
-    ) -> Poll<io::Result<PollRecvMultiData>> {
+    ) -> Poll<io::Result<PollRecvData>> {
         #[cfg(not(target_os = "linux"))]
         {
             // Simple polling for non-Linux platforms
-            let (ref mut rx, local_addr) = self.path_rxs[path_id];
+            let (ref mut rx, _) = self.path_rxs[path_id];
             let mut buf = tokio::io::ReadBuf::new(&mut self.buffers[path_id]);
 
             match rx.poll_recv_from(cx, &mut buf) {
@@ -375,13 +365,13 @@ where
                     );
                     buf.truncate(bytes);
 
-                    Poll::Ready(Ok(PollRecvMultiData {
+                    Poll::Ready(Ok(PollRecvData {
                         bytes,
                         src_addr: peer_addr,
                         dst_addr_override: None,
                         rx_time: None,
                         gro: None,
-                        path_id: Some(path_id as u64),
+                        path_id: path_id as u64,
                     }))
                 },
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -533,7 +523,7 @@ where
                             };
                         }
 
-                        return Poll::Ready(Ok(PollRecvMultiData {
+                        return Poll::Ready(Ok(PollRecvData {
                             bytes,
                             src_addr: peer_addr,
                             dst_addr_override,
@@ -555,13 +545,13 @@ where
     #[cfg(target_os = "linux")]
     fn poll_path_simple(
         &mut self, cx: &mut Context<'_>, path_id: usize,
-    ) -> Poll<io::Result<PollRecvMultiData>> {
+    ) -> Poll<io::Result<PollRecvData>> {
         use std::task::ready;
         // Fallback implementation for non-UDP sockets on Linux
         let (ref mut rx, _) = self.path_rxs[path_id];
         let mut buf = tokio::io::ReadBuf::new(&mut self.buffers[path_id]);
         let addr = ready!(rx.poll_recv_from(cx, &mut buf))?;
-        Poll::Ready(Ok(PollRecvMultiData {
+        Poll::Ready(Ok(PollRecvData {
             bytes: buf.filled().len(),
             src_addr: addr,
             rx_time: None,
@@ -658,7 +648,7 @@ where
                     buf,
                     rx_time: data.rx_time,
                     gro: data.gro,
-                    path_id: Some(data.path_id),
+                    path_id: data.path_id,
                 };
 
                 if let Err(e) = self.on_incoming(incoming) {

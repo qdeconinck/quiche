@@ -55,14 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = url.port().unwrap_or(match scheme {
         "https" => 443,
         "http" => 80,
-        _ => return Err(format!("Unsupported scheme: {}", scheme).into()),
+        _ => return Err(format!("Unsupported scheme: {scheme}").into()),
     });
     let path = url.path();
 
     info!("Requesting URL: {}", args.url);
     info!(
-        "Parsed - scheme: {}, host: {}, port: {}, path: {}",
-        scheme, host, port, path
+        "Parsed - scheme: {scheme}, host: {host}, port: {port}, path: {path}"
     );
 
     let mut params = ConnectionParams::default();
@@ -70,12 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.multipath {
         let addrs = args.addresses.len();
-        info!("Multipath enabled with {} additional addresses", addrs);
+        info!("Multipath enabled with {addrs} additional addresses");
 
         params.settings.initial_max_path_id = Some(addrs as u64);
     }
 
-    let server_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let server_addr: SocketAddr = format!("{host}:{port}").parse()?;
     let mut sockets: Vec<Socket<Arc<UdpSocket>, Arc<UdpSocket>>> = Vec::new();
     for addr in &args.addresses {
         let udp_socket = UdpSocket::bind(addr).await?;
@@ -108,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         driver,
     )
     .await
-    .map_err(|e| format!("Failed to connect: {}", e))?;
+    .map_err(|e| format!("Failed to connect: {e}"))?;
 
     info!("Connected! QUIC connection established");
 
@@ -123,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Start probing all additional addresses
         for &addr in add_addresses {
-            info!("Probing path from {} to {}", addr, server_addr);
+            info!("Probing path from {addr} to {server_addr}");
             controller
                 .cmd_sender()
                 .send(tokio_quiche::quic::QuicCommand::OpenPath(
@@ -153,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if probes_pending > 0 {
-            warn!("{} path probes timed out", probes_pending);
+            warn!("{probes_pending} path probes timed out");
         }
 
         info!("Path probing completed, proceeding with HTTP request");
@@ -186,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 },
             )) => {
-                info!("Received headers on stream {}: {:?}", stream_id, headers);
+                info!("Received headers on stream {stream_id}: {headers:?}");
 
                 let mut response_body = Vec::new();
 
@@ -225,22 +224,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio_quiche::quic::ConnectionShutdownBehaviour {
                             send_application_close: false,
                             error_code: 0,
-                            reason: Vec::new(),
+                            reason: b"Response complete".to_vec(),
                         },
                     ))
                     .ok();
-                break;
             },
             ClientH3Event::Core(event) => {
-                info!("Received event: {:?}", event);
+                info!("Received event: {event:?}");
             },
             ClientH3Event::NewOutboundRequest {
                 stream_id,
                 request_id,
             } => {
                 info!(
-                    "Sending outbound request - stream_id: {}, request_id: {}",
-                    stream_id, request_id
+                    "Sending outbound request - stream_id: {stream_id}, request_id: {request_id}"
                 );
             },
         }
