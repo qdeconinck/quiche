@@ -89,7 +89,7 @@ where
 /// [`quiche::Connection`]. To start handshaking and consuming packets from the
 /// returned channel, use the methods on [`InitialQuicConnection`].
 pub fn wrap_quiche_conn<Tx, R, M>(
-    quiche_conn: QuicheConnection, tx_socket: Vec<Socket<Arc<Tx>, R>>,
+    quiche_conn: QuicheConnection, tx_sockets: Vec<Socket<Arc<Tx>, R>>,
     metrics: M, packet_scheduler: Option<BoxedScheduler>,
 ) -> ConnWrapperResult<Tx, M>
 where
@@ -98,12 +98,12 @@ where
 {
     let mut sockets = vec![];
     let mut local_addrs = vec![];
-    let peer_addr = tx_socket
+    let peer_addr = tx_sockets
         .iter()
         .map(|s: &Socket<Arc<Tx>, R>| s.peer_addr)
         .next()
         .expect("no socket provided");
-    for socket in &tx_socket {
+    for socket in &tx_sockets {
         let Socket {
             send, local_addr, ..
         } = socket;

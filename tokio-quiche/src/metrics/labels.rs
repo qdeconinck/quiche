@@ -226,6 +226,12 @@ impl Serialize for QuicError {
             0x11 => "VERSION_NEGOTIATION_ERROR",
             0x100..=0x1ff => "CRYPTO_ERROR",
 
+            // https://www.ietf.org/archive/id/draft-ietf-quic-multipath-14.html#table-4
+            0x004150504142414e => "APPLICATION_ABANDON",
+            0x0052534c494d4954 => "RESOURCE_LIMIT_REACHED",
+            0x00554e5f494e5446 => "UNSTABLE_INTERFACE",
+            0x004e4f5f4349445f => "NO_CID_AVAILABLE",
+
             _ => "QUIC_UNKNOWN",
         };
         serializer.serialize_str(v)

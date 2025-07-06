@@ -761,10 +761,21 @@ impl QuicCommand {
             },
             Self::OpenPath(path_id, local_addr, peer_addr) => {
                 if !qconn.is_server() && qconn.is_multipath_enabled() {
-                    let path_id = path_id.unwrap_or_else(|| {
-                        qconn.next_available_path_id().unwrap()
+                    let path_id = path_id.or_else(|| {
+                        match qconn.next_available_path_id() {
+                            Ok(id) => Some(id),
+                            Err(_) => {
+                                log::warn!(
+                                    "No available path ID for probing new path"
+                                );
+                                None
+                            },
+                        }
                     });
-                    let _ = qconn.probe_path(path_id, local_addr, peer_addr);
+
+                    if let Some(path_id) = path_id {
+                        let _ = qconn.probe_path(path_id, local_addr, peer_addr);
+                    }
                 }
             },
         }

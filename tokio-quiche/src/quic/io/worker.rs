@@ -162,8 +162,6 @@ where
         let bw_estimator =
             BandwidthReporter::new(params.metrics.utilized_bandwidth());
 
-        log::trace!("Creating IoWorker with stage: {conn_stage:?}");
-
         Self {
             id: params.id,
             sockets: params.sockets,
@@ -539,15 +537,24 @@ where
                 let send_from = send_info.as_ref().map(|info| info.from);
                 let send_to = send_info.as_ref().map(|info| info.to);
 
-                self.write_state.bytes_written += packet_size;
-                self.write_state.num_pkts += 1;
-                self.write_state.send_from = send_from;
-                self.write_state.send_to = send_to;
-                let network_path_id = qconn
-                    .network_path_id_from(send_from.unwrap(), send_to.unwrap());
-                self.write_state.network_path_id = network_path_id;
+                // Ensure both send_from and send_to are available
+                match (send_from, send_to) {
+                    (Some(from), Some(to)) => {
+                        self.write_state.bytes_written += packet_size;
+                        self.write_state.num_pkts += 1;
+                        self.write_state.send_from = Some(from);
+                        self.write_state.send_to = Some(to);
+                        let network_path_id =
+                            qconn.network_path_id_from(from, to);
+                        self.write_state.network_path_id = network_path_id;
 
-                Ok(packet_size)
+                        Ok(packet_size)
+                    },
+                    _ => {
+                        // Missing send_from or send_to information
+                        Err(Box::new(QuicheError::InvalidState))
+                    },
+                }
             },
             Err(QuicheError::Done) => {
                 // Flush to network and yield when there are no
@@ -577,26 +584,30 @@ where
         if self.write_state.bytes_written > 0 {
             let current_send_buf = &send_buf[..self.write_state.bytes_written];
 
-            // Select the socket based on path_id if available
-            let socket_index =
-                if let Some(path_id) = self.write_state.network_path_id {
-                    // Ensure path_id is within bounds (default to first socket if
-                    // not)
-                    if path_id < self.sockets.len() {
-                        path_id
-                    } else {
-                        log::warn!(
-                            "Path ID {} is out of bounds, using socket 0",
-                            path_id
-                        );
-                        0
-                    }
-                } else {
-                    // No path_id, use the first socket
-                    0
-                };
+            let socket_index = match self.write_state.network_path_id {
+                Some(path_id) => path_id,
+                None => {
+                    log::error!(
+                        "{}: No network path ID available for sending data",
+                        self.id
+                    );
+                    self.metrics.write_errors(labels::QuicWriteError::Err).inc();
+                    return;
+                },
+            };
 
-            let socket = &self.sockets[socket_index];
+            let socket = match self.sockets.get(socket_index) {
+                Some(socket) => socket,
+                None => {
+                    log::error!(
+                        "{}: No socket found for the socket index {}",
+                        self.id,
+                        socket_index
+                    );
+                    self.metrics.write_errors(labels::QuicWriteError::Err).inc();
+                    return;
+                },
+            };
             let peer_addr = self.write_state.send_to.unwrap_or({
                 // Default to the peer address if send_to is not set
                 self.cfg.peer_addr
@@ -650,9 +661,10 @@ where
             // Only send MapCid if this is a new CID we haven't mapped before
             if !self.known_cids.contains(&owned_cid) {
                 log::trace!(
-                    "Mapping new SCID {:?} to connection ID {}",
+                    "{}: Mapping new SCID {:?} for connection {}",
+                    self.id,
                     owned_cid,
-                    self.id
+                    qconn.trace_id()
                 );
                 let _ = self.conn_map_cmd_tx.send(ConnectionMapCommand::MapCid(
                     owned_cid.clone(),
@@ -667,7 +679,13 @@ where
             qconn.retired_scid_on_path_next()
         {
             let owned_scid = retired_scid.into_owned();
-            log::trace!("Retired SCID {:?} on path ID {}", owned_scid, path_id);
+            log::trace!(
+                "{}: Retired SCID {:?} on path ID {} for connection {}",
+                self.id,
+                owned_scid,
+                path_id,
+                qconn.trace_id()
+            );
 
             // Remove from our known set and send unmap command
             self.known_cids.remove(&owned_scid);
@@ -688,8 +706,10 @@ where
 
         for missing_cid in missing_cids {
             log::trace!(
-                "CID {:?} is no longer active but wasn't explicitly retired",
-                missing_cid
+                "{}: CID {:?} for connection {} is no longer active but wasn't explicitly retired",
+                self.id,
+                missing_cid,
+                qconn.trace_id()
             );
             self.known_cids.remove(&missing_cid);
             let _ = self
@@ -728,10 +748,12 @@ where
             match event {
                 quiche::PathEvent::New(local_addr, peer_addr) => {
                     log::info!(
-                        "Seen new path ({}, {}) with ID {}",
+                        "{}: Seen new path ({}, {}) with ID {} for connection {}",
+                        self.id,
                         local_addr,
                         peer_addr,
-                        path_id
+                        path_id,
+                        qconn.trace_id()
                     );
 
                     // If we're a server, we need to probe back the path in
@@ -741,10 +763,12 @@ where
                             qconn.probe_path(path_id, local_addr, peer_addr)
                         {
                             log::error!(
-                                "Cannot probe path ({},{}): {}",
+                                "{}: Cannot probe path ({},{}): {} for connection {}",
+                                self.id,
                                 local_addr,
                                 peer_addr,
-                                e
+                                e,
+                                qconn.trace_id()
                             );
                         }
                     }
@@ -752,20 +776,24 @@ where
 
                 quiche::PathEvent::Validated(local_addr, peer_addr) => {
                     log::info!(
-                        "Path ({}, {}) with ID {} is now validated",
+                        "{}: Path ({}, {}) with ID {} is now validated for connection {}",
+                        self.id,
                         local_addr,
                         peer_addr,
-                        path_id
+                        path_id,
+                        qconn.trace_id()
                     );
 
                     // Activate the path for multipath connections
                     if qconn.is_multipath_enabled() {
                         if let Err(e) = qconn.set_active(path_id, true) {
                             log::error!(
-                                "Cannot set path active ({},{}): {}",
+                                "{}: Cannot set path active ({},{}): {} for connection {}",
+                                self.id,
                                 local_addr,
                                 peer_addr,
-                                e
+                                e,
+                                qconn.trace_id()
                             );
                         }
                     }
@@ -773,19 +801,23 @@ where
 
                 quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
                     log::info!(
-                        "Path ({}, {}) with ID {} failed validation",
+                        "{}: Path ({}, {}) with ID {} failed validation for connection {}",
+                        self.id,
                         local_addr,
                         peer_addr,
-                        path_id
+                        path_id,
+                        qconn.trace_id()
                     );
                 },
 
                 quiche::PathEvent::Closed(local_addr, peer_addr, err) => {
                     log::info!(
-                        "Path ({}, {}) with ID {} is now closed and unusable; err = {}",
+                        "{}: Path ({}, {}) with ID {} for connection {} is now closed and unusable; err = {}",
+                        self.id,
                         local_addr,
                         peer_addr,
                         path_id,
+                        qconn.trace_id(),
                         err,
                     );
                 },
@@ -796,33 +828,42 @@ where
                     new,
                 ) => {
                     log::info!(
-                        "Peer reused cid seq {} (initially {:?}) on {:?} on path ID {}",
-                        cid_seq, old, new, path_id
+                        "{}: Peer reused cid seq {} (initially {:?}) on {:?} on path ID {} for connection {}",
+                        self.id,
+                        cid_seq,
+                        old,
+                        new,
+                        path_id,
+                        qconn.trace_id()
                     );
                 },
 
                 quiche::PathEvent::PeerMigrated(local_addr, peer_addr) => {
                     log::info!(
-                        "Connection migrated to ({}, {}) on Path ID {}",
+                        "{}: Connection migrated to ({}, {}) on Path ID {} for connection {}",
+                        self.id,
                         local_addr,
                         peer_addr,
-                        path_id
+                        path_id,
+                        qconn.trace_id()
                     );
                     // TODO: Update routing map if needed
                 },
 
                 quiche::PathEvent::PeerPathStatus(addr, path_status) => {
                     log::info!(
-                        "Peer asks status {:?} for {:?} on path ID {}",
+                        "{}: Peer asks status {:?} for {:?} on path ID {} for connection {}",
+                        self.id,
                         path_status,
                         addr,
-                        path_id
+                        path_id,
+                        qconn.trace_id()
                     );
 
                     if let Err(e) =
                         qconn.set_path_status(path_id, path_status, false)
                     {
-                        log::error!("Cannot follow status request: {}", e);
+                        log::error!("{}: Cannot follow status request: {} for connection {}", self.id, e, qconn.trace_id());
                     }
                 },
             }
