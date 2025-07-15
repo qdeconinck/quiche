@@ -488,17 +488,25 @@ where
                                 send_info.as_ref().map(|info| info.from);
                             let send_to = send_info.as_ref().map(|info| info.to);
 
-                            self.write_state.bytes_written += packet_size;
-                            self.write_state.num_pkts += 1;
-                            self.write_state.send_from = send_from;
-                            self.write_state.send_to = send_to;
-                            let network_path_id = qconn.network_path_id_from(
-                                send_from.unwrap(),
-                                send_to.unwrap(),
-                            );
-                            self.write_state.network_path_id = network_path_id;
+                            match (send_from, send_to) {
+                                (Some(from), Some(to)) => {
+                                    self.write_state.bytes_written += packet_size;
+                                    self.write_state.num_pkts += 1;
+                                    self.write_state.send_from = Some(from);
+                                    self.write_state.send_to = Some(to);
+                                    let network_path_id =
+                                        qconn.network_path_id_from(from, to);
+                                    self.write_state.network_path_id =
+                                        network_path_id;
 
-                            return Ok(packet_size);
+                                    return Ok(packet_size);
+                                },
+                                _ => {
+                                    return Err(Box::new(
+                                        QuicheError::InvalidState,
+                                    ));
+                                },
+                            }
                         },
                         Err(QuicheError::Done) => {
                             // Flush to network and yield when there are no
@@ -585,7 +593,15 @@ where
             let current_send_buf = &send_buf[..self.write_state.bytes_written];
 
             let socket_index = match self.write_state.network_path_id {
-                Some(path_id) => path_id,
+                Some(path_id) => {
+                    // Always use socket 0 regardless of path ID if there is only
+                    // one (used by the server).
+                    if self.sockets.len() == 1 {
+                        0
+                    } else {
+                        path_id
+                    }
+                },
                 None => {
                     log::error!(
                         "{}: No network path ID available for sending data",
@@ -599,10 +615,9 @@ where
             let socket = match self.sockets.get(socket_index) {
                 Some(socket) => socket,
                 None => {
-                    log::error!(
+                    eprintln!(
                         "{}: No socket found for the socket index {}",
-                        self.id,
-                        socket_index
+                        self.id, socket_index
                     );
                     self.metrics.write_errors(labels::QuicWriteError::Err).inc();
                     return;
