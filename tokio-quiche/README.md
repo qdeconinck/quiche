@@ -209,7 +209,7 @@ The `examples/http` directory contains HTTP/3 client and server examples with MP
 ### Server with Multipath
 
 ```bash
-# Start server with multipath enabled (max 2 paths) using MinRTT scheduler
+# Start server with multipath enabled (max 3 paths) using MinRTT scheduler
 cargo run --bin http3-server -- --initial-max-path-id 2 --packet-scheduler minrtt .
 ```
 

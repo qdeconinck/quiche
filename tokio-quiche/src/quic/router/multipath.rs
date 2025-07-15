@@ -366,7 +366,6 @@ where
                         dst_addr_override: None,
                         rx_time: None,
                         gro: None,
-                        path_id: path_id as u64,
                     }))
                 },
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -643,7 +642,6 @@ where
                     buf,
                     rx_time: data.rx_time,
                     gro: data.gro,
-                    path_id: data.path_id,
                 };
 
                 if let Err(e) = self.on_incoming(incoming) {
