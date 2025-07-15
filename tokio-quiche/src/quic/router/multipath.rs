@@ -523,7 +523,6 @@ where
                             dst_addr_override,
                             rx_time,
                             gro,
-                            path_id: path_id as u64,
                         }));
                     },
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -551,7 +550,6 @@ where
             rx_time: None,
             gro: None,
             dst_addr_override: None,
-            path_id: path_id as u64,
         }))
     }
 

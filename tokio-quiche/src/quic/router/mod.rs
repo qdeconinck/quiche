@@ -542,7 +542,6 @@ where
                             dst_addr_override,
                             rx_time,
                             gro,
-                            path_id: 0,
                         }));
                     },
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
