@@ -69,6 +69,7 @@ pub use tokio_quiche::ServerH3Connection;
 pub use tokio_quiche::ServerH3Driver;
 
 pub mod h3i_fixtures;
+pub mod multipath;
 
 use h3i_fixtures::stream_body;
 

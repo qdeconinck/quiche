@@ -326,3 +326,52 @@ impl PacketScheduler for LowestLatencyScheduler {
         PacketSchedulingAlgorithm::LowestLatency
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scheduler_factory_create() {
+        let scheduler =
+            PacketSchedulerFactory::create(PacketSchedulingAlgorithm::MinRTT);
+        assert_eq!(scheduler.algorithm(), PacketSchedulingAlgorithm::MinRTT);
+        assert_eq!(scheduler.name(), "minrtt");
+
+        let scheduler =
+            PacketSchedulerFactory::create(PacketSchedulingAlgorithm::RoundRobin);
+        assert_eq!(scheduler.algorithm(), PacketSchedulingAlgorithm::RoundRobin);
+        assert_eq!(scheduler.name(), "roundrobin");
+
+        let scheduler =
+            PacketSchedulerFactory::create(PacketSchedulingAlgorithm::Random);
+        assert_eq!(scheduler.algorithm(), PacketSchedulingAlgorithm::Random);
+        assert_eq!(scheduler.name(), "random");
+
+        let scheduler = PacketSchedulerFactory::create(
+            PacketSchedulingAlgorithm::LowestLatency,
+        );
+        assert_eq!(
+            scheduler.algorithm(),
+            PacketSchedulingAlgorithm::LowestLatency
+        );
+        assert_eq!(scheduler.name(), "lowestlatency");
+    }
+
+    #[test]
+    fn test_round_robin_index_cycling() {
+        let scheduler = RoundRobinScheduler::new();
+
+        // Test that the internal index starts at 0
+        assert_eq!(scheduler.current_index.load(Relaxed), 0);
+
+        // Test that fetch_add increments the index
+        let idx1 = scheduler.current_index.fetch_add(1, Relaxed);
+        assert_eq!(idx1, 0);
+        assert_eq!(scheduler.current_index.load(Relaxed), 1);
+
+        let idx2 = scheduler.current_index.fetch_add(1, Relaxed);
+        assert_eq!(idx2, 1);
+        assert_eq!(scheduler.current_index.load(Relaxed), 2);
+    }
+}
