@@ -46,7 +46,6 @@ foundations = { workspace = true, default-features = false, features = [
 futures = { workspace = true }
 futures-util = { workspace = true }
 ipnetwork = { workspace = true }
-itertools = { version = "0.14.0" }
 rand = { workspace = true }
 log = { workspace = true }
 octets = { workspace = true }

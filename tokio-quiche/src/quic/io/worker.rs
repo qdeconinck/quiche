@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -114,8 +115,8 @@ pub(crate) struct WriteState {
     send_from: Option<SocketAddr>,
     /// Socket address used as the destination for outgoing packets
     send_to: Option<SocketAddr>,
-    /// Path identifier
-    network_path_id: Option<usize>,
+    /// Socket identifier
+    socket_id: usize,
 }
 
 pub(crate) struct IoWorkerParams<Tx, M> {
@@ -135,6 +136,7 @@ pub(crate) struct IoWorkerParams<Tx, M> {
 pub(crate) struct IoWorker<Tx, M, S> {
     id: u64,
     sockets: Vec<MaybeConnectedSocket<Tx>>,
+    addr_to_socket: BTreeMap<SocketAddr, usize>,
     /// A field that signals to the listener task that the connection has gone
     /// away (nothing is sent here, listener task just detects the sender
     /// has dropped)
@@ -162,9 +164,19 @@ where
         let bw_estimator =
             BandwidthReporter::new(params.metrics.utilized_bandwidth());
 
+        let mut addr_to_socket = BTreeMap::new();
+        for (index, socket) in params.sockets.iter().enumerate() {
+            if let Some(udp_socket) = socket.as_udp_socket() {
+                if let Ok(local_addr) = udp_socket.local_addr() {
+                    addr_to_socket.insert(local_addr, index);
+                }
+            }
+        }
+
         Self {
             id: params.id,
             sockets: params.sockets,
+            addr_to_socket,
             shutdown_tx: params.shutdown_tx,
             cfg: params.cfg,
             audit_log_stats: params.audit_log_stats,
@@ -468,11 +480,7 @@ where
             send_buf = &mut send_buf[..segment_size.unwrap_or(usize::MAX)];
         }
 
-        let multipath_enabled = qconn.is_multipath_enabled() &&
-            qconn.is_established() &&
-            qconn.is_handshake_confirmed();
-
-        if multipath_enabled {
+        if qconn.is_multipath_enabled() {
             if let Some(scheduler) = &mut self.packet_scheduler {
                 if let Some((local_addr, peer_addr)) = scheduler.next_path(qconn)
                 {
@@ -494,10 +502,8 @@ where
                                     self.write_state.num_pkts += 1;
                                     self.write_state.send_from = Some(from);
                                     self.write_state.send_to = Some(to);
-                                    let network_path_id =
-                                        qconn.network_path_id_from(from, to);
-                                    self.write_state.network_path_id =
-                                        network_path_id;
+                                    self.write_state.socket_id =
+                                        self.get_socket_id_for_address(from);
 
                                     return Ok(packet_size);
                                 },
@@ -552,9 +558,8 @@ where
                         self.write_state.num_pkts += 1;
                         self.write_state.send_from = Some(from);
                         self.write_state.send_to = Some(to);
-                        let network_path_id =
-                            qconn.network_path_id_from(from, to);
-                        self.write_state.network_path_id = network_path_id;
+                        self.write_state.socket_id =
+                            self.get_socket_id_for_address(from);
 
                         Ok(packet_size)
                     },
@@ -592,25 +597,7 @@ where
         if self.write_state.bytes_written > 0 {
             let current_send_buf = &send_buf[..self.write_state.bytes_written];
 
-            let socket_index = match self.write_state.network_path_id {
-                Some(path_id) => {
-                    // Always use socket 0 regardless of path ID if there is only
-                    // one (used by the server).
-                    if self.sockets.len() == 1 {
-                        0
-                    } else {
-                        path_id
-                    }
-                },
-                None => {
-                    log::error!(
-                        "{}: No network path ID available for sending data",
-                        self.id
-                    );
-                    self.metrics.write_errors(labels::QuicWriteError::Err).inc();
-                    return;
-                },
-            };
+            let socket_index = self.write_state.socket_id;
 
             let socket = match self.sockets.get(socket_index) {
                 Some(socket) => socket,
@@ -885,6 +872,19 @@ where
         }
 
         Ok(())
+    }
+
+    fn get_socket_id_for_address(&self, from: SocketAddr) -> usize {
+        match self.addr_to_socket.get(&from) {
+            Some(&socket_id) => socket_id,
+            None => {
+                log::warn!(
+                    "{}: No socket found for local address {}, using default socket 0",
+                    self.id, from
+                );
+                0
+            },
+        }
     }
 
     /// When a connection is established, process application data, if not the

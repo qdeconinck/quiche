@@ -7303,21 +7303,11 @@ impl Connection {
         }
     }
 
-    /// Returns the Path ID associated with the given local and peer
-    /// addresses.
-    #[inline]
-    pub fn network_path_id_from(
-        &self, from: SocketAddr, to: SocketAddr,
-    ) -> Option<usize> {
-        let network_path_id = self.paths.network_path_id_from_addrs(&(from, to));
-        network_path_id.map(|id| id.0)
-    }
-
     /// Returns whether the multipath extensions have been enabled on this
     /// connection.
     #[inline]
     pub fn is_multipath_enabled(&self) -> bool {
-        self.paths.multipath()
+        self.paths.multipath() && self.is_established()
     }
 
     /// Closes the connection with the given error and reason.

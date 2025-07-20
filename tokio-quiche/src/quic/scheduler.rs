@@ -24,7 +24,6 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use itertools::Itertools;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::fmt::Debug;
@@ -92,11 +91,6 @@ impl FromStr for PacketSchedulingAlgorithm {
 /// Trait defining a packet scheduler that can determine which path to use for
 /// sending packets
 pub trait PacketScheduler: Debug + Send + Sync + 'static {
-    /// Returns an ordered list of paths according to the scheduler's algorithm.
-    fn schedule<'a>(
-        &self, conn: &'a QuicheConnection,
-    ) -> Box<dyn Iterator<Item = (SocketAddr, SocketAddr)> + 'a>;
-
     /// Get the next path to send a packet on
     fn next_path(
         &self, conn: &QuicheConnection,
@@ -149,17 +143,6 @@ impl Default for MinRTTScheduler {
 }
 
 impl PacketScheduler for MinRTTScheduler {
-    fn schedule<'a>(
-        &self, conn: &'a QuicheConnection,
-    ) -> Box<dyn Iterator<Item = (SocketAddr, SocketAddr)> + 'a> {
-        let paths = conn
-            .path_stats()
-            .filter(|p| !matches!(p.state, quiche::PathState::Closed(_)))
-            .sorted_by_key(|p| p.rtt)
-            .map(|p| (p.local_addr, p.peer_addr));
-        Box::new(paths)
-    }
-
     fn next_path(
         &self, conn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
@@ -214,16 +197,6 @@ impl Default for RoundRobinScheduler {
 }
 
 impl PacketScheduler for RoundRobinScheduler {
-    fn schedule<'a>(
-        &self, conn: &'a QuicheConnection,
-    ) -> Box<dyn Iterator<Item = (SocketAddr, SocketAddr)> + 'a> {
-        let paths = conn
-            .path_stats()
-            .sorted_by_key(|p| p.local_addr)
-            .map(|p| (p.local_addr, p.peer_addr));
-        Box::new(paths)
-    }
-
     fn next_path(
         &self, conn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
@@ -276,14 +249,6 @@ impl Default for RandomScheduler {
 }
 
 impl PacketScheduler for RandomScheduler {
-    fn schedule<'a>(
-        &self, conn: &'a QuicheConnection,
-    ) -> Box<dyn Iterator<Item = (SocketAddr, SocketAddr)> + 'a> {
-        let mut paths = conn.path_stats().collect::<Vec<quiche::PathStats>>();
-        paths.shuffle(&mut thread_rng());
-        Box::new(paths.into_iter().map(|p| (p.local_addr, p.peer_addr)))
-    }
-
     fn next_path(
         &self, conn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
@@ -331,17 +296,6 @@ impl Default for LowestLatencyScheduler {
 }
 
 impl PacketScheduler for LowestLatencyScheduler {
-    fn schedule<'a>(
-        &self, conn: &'a QuicheConnection,
-    ) -> Box<dyn Iterator<Item = (SocketAddr, SocketAddr)> + 'a> {
-        let paths = conn
-            .path_stats()
-            .filter(|p| !matches!(p.state, quiche::PathState::Closed(_)))
-            .sorted_by_key(|p| p.rtt + (2 * p.rttvar))
-            .map(|p| (p.local_addr, p.peer_addr));
-        Box::new(paths)
-    }
-
     fn next_path(
         &self, conn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
