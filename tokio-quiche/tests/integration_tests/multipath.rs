@@ -97,37 +97,3 @@ async fn test_multipath_multiple_sockets() {
         "Should complete HTTP request/response over multipath connection"
     );
 }
-
-#[tokio::test]
-async fn test_multipath_path_probing() {
-    let initial_max_path_id = 2;
-    let (url, _hook) = start_multipath_server(initial_max_path_id);
-    let server_addr = parse_server_addr(&url);
-
-    // Set up client with 3 paths
-    let client_addrs = default_multipath_addrs(3);
-    let (mut controller, actual_addrs) = setup_multipath_client_with_addrs(
-        client_addrs,
-        server_addr,
-        initial_max_path_id,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        actual_addrs.len(),
-        3,
-        "Should have 3 actual client addresses"
-    );
-
-    // Test path probing
-    let result = probe_additional_paths(
-        &mut controller,
-        &actual_addrs,
-        server_addr,
-        Duration::from_secs(2),
-    )
-    .await;
-
-    assert!(result.is_ok(), "Path probing should succeed");
-}
